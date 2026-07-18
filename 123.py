@@ -2,71 +2,323 @@ import tkinter as tk
 from tkinter import simpledialog
 import keyboard
 import threading
-from multiprocessing import Process
 import time
 from threading import Thread
-import keyboard
+import queue
 import socket
-import pygame
-import requests
-import sys
+import uuid
+from dataclasses import dataclass, field
+from typing import Callable, Optional
+
+# =============================================================================
+# Надёжный TCP-канал (вшит из reliable_net)
+# =============================================================================
+
+USE_CMD_ID_PROTOCOL = True
+COMPAT_ANY_ACK = True
+ONE_SHOT_SERVER = True
+DEFAULT_TIMEOUT = 12.0
+KEEPALIVE_TIMEOUT = 1.5
+DEFAULT_RETRIES = 5
+BASE_BACKOFF = 0.35
+MAX_BACKOFF = 4.0
 
 
-def lift(arg_lift):
-    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # создаем сокет клиента
-    client.settimeout(5.0)
-    client.connect((hostname_local_rasb_2, port2))  # подключаемся к серверу
+def _new_cmd_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+@dataclass
+class _Job:
+    payload: str
+    cmd_id: str
+    timeout: float
+    retries: int
+    coalesce_key: Optional[str]
+    done: threading.Event = field(default_factory=threading.Event)
+    success: bool = False
+    response: str = ""
+    error: str = ""
+    callback: Optional[Callable[[bool, str], None]] = None
+
+
+class ReliableLink:
+    """Один канал к хосту: очередь → connect/reuse → sendall → ACK → retry."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        name: str = "link",
+        timeout: float = DEFAULT_TIMEOUT,
+        retries: int = DEFAULT_RETRIES,
+        one_shot: Optional[bool] = None,
+    ):
+        self.host = host
+        self.port = port
+        self.name = name
+        self.timeout = timeout
+        self.retries = retries
+        self.one_shot = ONE_SHOT_SERVER if one_shot is None else one_shot
+
+        self._sock: Optional[socket.socket] = None
+        self._io_lock = threading.RLock()
+        self._q: queue.Queue = queue.Queue()
+        self._coalesce: dict = {}
+        self._coalesce_lock = threading.Lock()
+        self._closed = False
+
+        self._worker = threading.Thread(
+            target=self._worker_loop, name=f"ReliableLink-{name}", daemon=True
+        )
+        self._worker.start()
+
+    def send(
+        self,
+        payload: str,
+        *,
+        wait: bool = True,
+        timeout: Optional[float] = None,
+        retries: Optional[int] = None,
+        coalesce_key: Optional[str] = None,
+        cmd_id: Optional[str] = None,
+        callback: Optional[Callable[[bool, str], None]] = None,
+    ) -> bool:
+        if self._closed:
+            return False
+
+        job = _Job(
+            payload=payload,
+            cmd_id=cmd_id or _new_cmd_id(),
+            timeout=self.timeout if timeout is None else timeout,
+            retries=self.retries if retries is None else retries,
+            coalesce_key=coalesce_key,
+            callback=callback,
+        )
+
+        if coalesce_key:
+            with self._coalesce_lock:
+                old = self._coalesce.get(coalesce_key)
+                if old is not None and not old.done.is_set():
+                    old.payload = payload
+                    old.cmd_id = job.cmd_id
+                    old.timeout = job.timeout
+                    old.retries = job.retries
+                    old.callback = callback or old.callback
+                    if wait:
+                        old.done.wait()
+                        return old.success
+                    return True
+                self._coalesce[coalesce_key] = job
+
+        self._q.put(job)
+
+        if wait:
+            job.done.wait()
+            return job.success
+        return True
+
+    def keepalive(self, payload: str = "ONLINE") -> bool:
+        return self.send(
+            payload,
+            wait=True,
+            timeout=KEEPALIVE_TIMEOUT,
+            retries=1,
+            coalesce_key=f"{self.name}:keepalive",
+        )
+
+    def close(self) -> None:
+        self._closed = True
+        self._q.put(None)
+        with self._io_lock:
+            self._close_sock()
+
+    def _worker_loop(self) -> None:
+        while not self._closed:
+            job = self._q.get()
+            if job is None:
+                break
+            try:
+                self._execute_job(job)
+            finally:
+                if job.coalesce_key:
+                    with self._coalesce_lock:
+                        if self._coalesce.get(job.coalesce_key) is job:
+                            self._coalesce.pop(job.coalesce_key, None)
+                job.done.set()
+                if job.callback:
+                    try:
+                        job.callback(job.success, job.response)
+                    except Exception as e:
+                        print(f"[{self.name}] callback error: {e}")
+
+    def _execute_job(self, job: _Job) -> None:
+        delay = BASE_BACKOFF
+        last_err = ""
+        for attempt in range(1, job.retries + 1):
+            ok, resp, err = self._attempt(job.payload, job.cmd_id, job.timeout)
+            if ok:
+                job.success = True
+                job.response = resp
+                if attempt > 1:
+                    print(f"[{self.name}] OK после попытки {attempt}: {job.payload!r}")
+                return
+            last_err = err
+            print(
+                f"[{self.name}] попытка {attempt}/{job.retries} "
+                f"не удалась ({job.payload!r}): {err}"
+            )
+            with self._io_lock:
+                self._close_sock()
+            if attempt < job.retries:
+                time.sleep(delay)
+                delay = min(delay * 2, MAX_BACKOFF)
+
+        job.success = False
+        job.error = last_err
+        job.response = ""
+        print(f"[{self.name}] команда окончательно не доставлена: {job.payload!r}")
+
+    def _attempt(self, payload: str, cmd_id: str, timeout: float):
+        with self._io_lock:
+            try:
+                sock = self._ensure_connected(timeout)
+                wire = self._encode(payload, cmd_id)
+                sock.settimeout(timeout)
+                sock.sendall(wire)
+                raw = sock.recv(1024)
+                if not raw:
+                    self._close_sock()
+                    return False, "", "пустой ответ / соединение закрыто"
+                text = raw.decode(errors="replace").strip()
+                if self._is_ack(text, cmd_id):
+                    if self.one_shot:
+                        self._close_sock()
+                    return True, text, ""
+                self._close_sock()
+                return False, text, f"неожиданный ACK: {text!r}"
+            except Exception as e:
+                self._close_sock()
+                return False, "", str(e)
+
+    def _encode(self, payload: str, cmd_id: str) -> bytes:
+        body = payload.strip()
+        if USE_CMD_ID_PROTOCOL and body.upper() != "ONLINE":
+            line = f"{body} id={cmd_id}\n"
+        else:
+            line = f"{body}\n"
+        return line.encode()
+
+    def _is_ack(self, text: str, cmd_id: str) -> bool:
+        upper = text.upper()
+        if upper.startswith("OK") or upper.startswith("DUP"):
+            if cmd_id and cmd_id in text:
+                return True
+            parts = text.replace("|", " ").split()
+            if len(parts) >= 2 and parts[1] and parts[1] != cmd_id:
+                return False
+            return True
+        if COMPAT_ANY_ACK and text:
+            return True
+        return False
+
+    def _ensure_connected(self, timeout: float) -> socket.socket:
+        if self._sock is not None:
+            return self._sock
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        self._enable_keepalive(sock)
+        sock.connect((self.host, self.port))
+        self._sock = sock
+        print(f"[{self.name}] подключено к {self.host}:{self.port}")
+        return sock
+
+    def _close_sock(self) -> None:
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
+
+    @staticmethod
+    def _enable_keepalive(sock: socket.socket) -> None:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        if hasattr(socket, "TCP_KEEPIDLE"):
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 10)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 3)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+            except OSError:
+                pass
+        if hasattr(socket, "SIO_KEEPALIVE_VALS"):
+            try:
+                sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 10000, 3000))
+            except OSError:
+                pass
+
+
+# --- сеть ---
+hostname = "37.9.243.135"
+hostname_local_rasb_1 = "192.168.8.4"
+hostname_local_rasb_2 = "192.168.0.169"
+port = 12345
+port2 = 12346
+
+# rasb1 — пока one_shot (старый сервер); rasb2 — постоянное соединение
+link_rasb1 = ReliableLink(hostname_local_rasb_1, port, name="rasb1", one_shot=True)
+link_rasb2 = ReliableLink(hostname_local_rasb_2, port2, name="rasb2", one_shot=False)
+
+filtrochistki_isOn = True
+periodvkl = 2400
+timeon = 0.5
+
+
+def lift(arg_lift, time_on):
+    """Отправляет команду подъёмникам. True — сервер подтвердил (OK/DUP/любой ACK)."""
     message = "lift " + str(arg_lift)
-    # 1.12 1.20 1.19 1.13 1.27  1.04   шаг 0.07-0.08 мВ при полном напряжении 2,36
-    client.send(message.encode())  # отправляем сообщение серверу
-    data = client.recv(1024)  # получаем данные с сервера
+    return link_rasb2.send(
+        message,
+        wait=True,
+        coalesce_key="lift",
+    )
 
 
 def startUs(arg_us, pos):
-    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # создаем сокет клиента
-    client.settimeout(3.0)
-    client.connect((hostname_local_rasb_1, port))  # подключаемся к серверу
-
     message = "startUs" + str(arg_us) + " " + str(pos)
     print(message)
-    # 1.12 1.20 1.19 1.13 1.27  1.04   шаг 0.07-0.08 мВ при полном напряжении 2,36
-    client.send(message.encode())  # отправляем сообщение серверу
-    data = client.recv(1024)  # получаем данные с сервера
-    print(data)
+    ok = link_rasb1.send(
+        message,
+        wait=True,
+        coalesce_key=f"startUs{arg_us}",
+    )
+    print("startUs ACK" if ok else "startUs FAIL")
+    return ok
 
 
 def run_elevator_new(polozhenie):
-    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # запуск элеватора стоп
-    client.settimeout(3.0)
-    client.connect((hostname_local_rasb_2, port2))  #
     message = "elevator " + str(polozhenie)
-    client.send(message.encode())  #
-    data = client.recv(1024)  #
-    print("Server sent: ", data.decode())
+    ok = link_rasb2.send(
+        message,
+        wait=True,
+        coalesce_key="elevator",
+    )
+    print("Server elevator:", "OK" if ok else "FAIL")
+    return ok
 
 
 def Start_filtr_ochistki():
     global filtrochistki_isOn
 
     while True:
-
         if filtrochistki_isOn:
             time.sleep(periodvkl)
-            client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # создаем сокет клиента
-            client.settimeout(3.0)
-            client.connect((hostname_local_rasb_1, port))  # подключаемся к серверу
-            message = "relle1pos 0"
-            client.send(message.encode())  # отправляем сообщение серверу
-            data = client.recv(1024)  # получаем данные с сервера
-
+            link_rasb1.send("relle1pos 0", wait=True, coalesce_key="relle1")
             time.sleep(timeon)
-            client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # создаем сокет клиента
-            client.settimeout(3.0)
-            client.connect((hostname_local_rasb_1, port))  # подключаемся к серверу
-            message2 = "relle1pos 1"
-            client.send(message2.encode())  # отправляем сообщение серверу
-            data2 = client.recv(1024)  # получаем данные с сервера
+            link_rasb1.send("relle1pos 1", wait=True, coalesce_key="relle1")
             time.sleep(1)
+        else:
+            time.sleep(0.5)
 
 
 def call_arduino(text=""):
@@ -84,64 +336,35 @@ def call_arduino(text=""):
 
 
 def Wake_On_Lan():
-    global gear2
-    global gear
-    global back
-    global back2
     while True:
-        # print("wakeUP")
         time.sleep(1)
-        slowf_wake_UP = wake_UP
-        slowf_wake_UP_Tread = Thread(target=slowf_wake_UP, args=(()))
-        slowf_wake_UP_Tread.start()
+        wake_UP()
 
 
 def wake_UP():
-    try:
-        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # создаем сокет клиента
-        client.settimeout(1.0)
-        client.connect((hostname_local_rasb_1, port))  # подключаемся к серверу
-        message = "ONLINE"
-        # 1.12 1.20 1.19 1.13 1.27  1.04   шаг 0.07-0.08 мВ при полном напряжении 2,36
-        client.send(message.encode())  # отправляем сообщение серверу
-        data = client.recv(1024)  # получаем данные с сервера
-    #   print("Server sent: ", data.decode())
-    except:
+    if not link_rasb1.keepalive("ONLINE"):
         print("Расбери 1 офлайн")
-    try:
-        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # создаем сокет клиента
-        client.settimeout(1.0)
-        client.connect((hostname_local_rasb_2, port2))  # подключаемся к серверу
-        message = "ONLINE"
-        # 1.12 1.20 1.19 1.13 1.27  1.04   шаг 0.07-0.08 мВ при полном напряжении 2,36
-        client.send(message.encode())  # отправляем сообщение серверу
-        data = client.recv(1024)  # получаем данные с сервера
-    except:
+    if not link_rasb2.keepalive("ONLINE"):
         print("Расбери 2 офлайн")
 
 
 def revers2_left(revers_gear2):
-    try:
-        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # создаем сокет клиента
-        client.settimeout(3.0)
-        client.connect((hostname_local_rasb_1, port))  # подключаемся к серверу
-        message = "revers2 " + str(revers_gear2)
-        client.send(message.encode())  # отправляем сообщение серверу
-        data = client.recv(1024)  # получаем данные с сервера
-    except:
-        print("Попытка Установки реверса 1 неудачна")
+    ok = link_rasb1.send(
+        "revers2 " + str(revers_gear2),
+        wait=True,
+        coalesce_key="revers2",
+    )
+    if not ok:
+        print("Попытка Установки реверса 2 неудачна")
 
 
 def revers1_right(revers_gear1):
-    try:
-
-        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # создаем сокет клиента
-        client.settimeout(3.0)
-        client.connect((hostname_local_rasb_1, port))  # подключаемся к серверу
-        message = "revers1 " + str(revers_gear1)
-        client.send(message.encode())  # отправляем сообщение серверу
-        data = client.recv(1024)  # получаем данные с сервера
-    except:
+    ok = link_rasb1.send(
+        "revers1 " + str(revers_gear1),
+        wait=True,
+        coalesce_key="revers1",
+    )
+    if not ok:
         print("Попытка Установки реверса 1 неудачна")
 
 
@@ -157,22 +380,10 @@ def swapgear_1engine_right(arg):
     if gear <= 2:
         gear = 0
     print(gear)
-    slow_revers1 = revers1_right
-    slowfTread_revers1 = Thread(target=slow_revers1, args=(revers_gear,))
-    slowfTread_revers1.start()
+    Thread(target=revers1_right, args=(revers_gear,), daemon=True).start()
 
-    # slow_revers2 = revers2
-    # slowfTread_revers2 = Thread(target=slow_revers2, args=(revers_gear,))
-    # slowfTread_revers2.start()
-
-    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # создаем сокет клиента
-    client.settimeout(3.0)
-    client.connect((hostname_local_rasb_1, port))  # подключаемся к серверу
     message = "start1gear" + str(gear)
-    # 1.12 1.20 1.19 1.13 1.27  1.04   шаг 0.07-0.08 мВ при полном напряжении 2,36
-    client.send(message.encode())  # отправляем сообщение серверу
-    data = client.recv(1024)  # получаем данные с сервера
-    #   print("Server sent: ", data.decode())
+    link_rasb1.send(message, wait=True, coalesce_key="start1gear")
 
 
 def swapgear_2engine_left(arg):
@@ -185,18 +396,10 @@ def swapgear_2engine_left(arg):
         revers_gear = -1
     if gear <= 2:
         gear = 0
-    slow_revers2 = revers2_left
-    slowfTread_revers2 = Thread(target=slow_revers2, args=(revers_gear,))
-    slowfTread_revers2.start()
+    Thread(target=revers2_left, args=(revers_gear,), daemon=True).start()
     print(gear)
-    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # создаем сокет клиента
-    client.settimeout(3.0)
-    client.connect((hostname_local_rasb_1, port))  # подключаемся к серверу
     message = "start2gear" + str(gear)
-    # 1.12 1.20 1.19 1.13 1.27  1.04   шаг 0.07-0.08 мВ при полном напряжении 2,36
-    client.send(message.encode())  # отправляем сообщение серверу
-    data = client.recv(1024)  # получаем данные с сервера
-    #   print("Server sent: ", data.decode())
+    link_rasb1.send(message, wait=True, coalesce_key="start2gear")
 
 
 def create_squares():
@@ -219,6 +422,10 @@ def create_squares():
     elevator_level = 1  # 0 - серый, 1 - серый, 2 - зелёный, 3 - красный
     mustache_level = 0  # 0 - красный, 1 - зелёный
     lift_level = 0  # 0 - красный, 1 - зелёный
+    # Последняя успешно выполненная команда подъёмников: None | "up" | "down"
+    # Повтор той же команды блокируется, пока не пройдёт противоположная.
+    lift_last_ok = None
+    lift_busy = False  # идёт ожидание ответа сервера
     pump_level = 0  # 0 - красный, 1 - зелёный
     filter_level = 0  # 0 - красный, 1 - зелёный
 
@@ -629,42 +836,81 @@ def create_squares():
     def on_mustache_key():
         nonlocal mustache_level
         mustache_level = (mustache_level + 1) % 2
+        level = mustache_level
+        update_circle(1, level, "2state")
+        print(f"Усы: {['красный', 'зелёный'][level]}")
 
-        startUs("3", mustache_level)
-        startUs("4", mustache_level)
+        def worker():
+            startUs("3", level)
+            startUs("4", level)
 
-        update_circle(1, mustache_level, "2state")
-        print(f"Усы: {['красный', 'зелёный'][mustache_level]}")
+        Thread(target=worker, daemon=True).start()
 
     def on_lift_key_down():
-        nonlocal lift_level
-        lift_level = 0
-        print("-1")
-        update_circle(2, lift_level, "2state")
+        nonlocal lift_level, lift_last_ok, lift_busy
 
-        slow_lift = lift
-        slowfTread_slow_lift = Thread(target=slow_lift, args=("-1",))
-        slowfTread_slow_lift.start()
+        if lift_busy:
+            print("Подъёмники: ждём ответ сервера...")
+            return
+        if lift_last_ok == "down":
+            print("Подъёмники вниз уже выполнены — сначала нажмите U (вверх)")
+            return
 
-        lift(str("-1"))
-        print(f"Подъёмники: {['красный', 'зелёный'][lift_level]}")
+        def worker():
+            nonlocal lift_level, lift_last_ok, lift_busy
+            lift_busy = True
+            try:
+                print("-1")
+                time_on = "1"
+                ok = lift("-1", time_on)
+                if ok:
+                    lift_level = 0
+                    lift_last_ok = "down"
+                    root.after(0, lambda: update_circle(2, 0, "2state"))
+                    print(f"Подъёмники: {['красный', 'зелёный'][lift_level]}")
+                else:
+                    print("Подъёмники вниз: сервер не подтвердил команду")
+            finally:
+                lift_busy = False
+
+        Thread(target=worker, daemon=True).start()
 
     def on_lift_key():
-        nonlocal lift_level
-        lift_level = 1
-        print("1")
-        update_circle(2, lift_level, "2state")
-        slow_lift = lift
-        slowfTread_slow_lift = Thread(target=slow_lift, args=("1",))
-        slowfTread_slow_lift.start()
-        print(f"Подъёмники: {['красный', 'зелёный'][lift_level]}")
+        nonlocal lift_level, lift_last_ok, lift_busy
+
+        if lift_busy:
+            print("Подъёмники: ждём ответ сервера...")
+            return
+        if lift_last_ok == "up":
+            print("Подъёмники вверх уже выполнены — сначала нажмите J (вниз)")
+            return
+
+        def worker():
+            nonlocal lift_level, lift_last_ok, lift_busy
+            lift_busy = True
+            try:
+                print("1")
+                time_on = "1"
+                ok = lift("1",time_on)
+                if ok:
+                    lift_level = 1
+                    lift_last_ok = "up"
+                    root.after(0, lambda: update_circle(2, 1, "2state"))
+                    print(f"Подъёмники: {['красный', 'зелёный'][lift_level]}")
+                else:
+                    print("Подъёмники вверх: сервер не подтвердил команду")
+            finally:
+                lift_busy = False
+
+        Thread(target=worker, daemon=True).start()
 
     def on_pump_key():
         nonlocal pump_level
         pump_level = (pump_level + 1) % 2
-        startUs("1", pump_level)
-        update_circle(3, pump_level, "2state")
-        print(f"Помпа: {['красный', 'зелёный'][pump_level]}")
+        level = pump_level
+        update_circle(3, level, "2state")
+        print(f"Помпа: {['красный', 'зелёный'][level]}")
+        Thread(target=startUs, args=("1", level), daemon=True).start()
 
     def on_filter_key():
         nonlocal filter_level, filter_interval, filter_period, dialog_active
@@ -755,24 +1001,20 @@ def create_squares():
     root.mainloop()
 
 
-hostname = "37.9.243.135"  # получаем хост локальной машины
-hostname_local_rasb_1 = "192.168.8.4"
-hostname_local_rasb_2 = "192.168.0.169"
-port = 12345  # устанавливаем порт сервера
-port2 = 12346
-#port2 = 12345
-filtrochistki_isOn = True
-periodvkl = 2400
-timeon = 0.5
 if __name__ == "__main__":
-    Wake_On_Lan_obj = Wake_On_Lan
-    Thread_Wake_On_Lan_obj = Thread(target=Wake_On_Lan_obj, args=())
-    Thread_Wake_On_Lan_obj.start()
+    print("Надёжный канал: очередь + retry + keepalive + cmd_id")
+    print(f"  rasb1 {hostname_local_rasb_1}:{port}")
+    print(f"  rasb2 {hostname_local_rasb_2}:{port2}")
 
-    create_squares_obj = create_squares
-    Thread_create_squares_obj = Thread(target=create_squares_obj, args=())
-    Thread_create_squares_obj.start()
+    Thread(target=Wake_On_Lan, daemon=True).start()
+    Thread(target=create_squares, daemon=True).start()
+    Thread(target=Start_filtr_ochistki, daemon=True).start()
 
-    create_Start_filtr_ochistki = Start_filtr_ochistki
-    Thread_create_Start_filtr_ochistki = Thread(target=create_Start_filtr_ochistki, args=())
-    Thread_create_Start_filtr_ochistki.start()
+    # держим главный поток живым, пока работает UI-поток
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        link_rasb1.close()
+        link_rasb2.close()
+        print("Выход")

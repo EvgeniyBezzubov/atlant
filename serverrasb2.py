@@ -187,9 +187,9 @@ def dispatch(payload: str) -> None:
         return
 
     if cmd == "lift":
-        if len(parts) < 2:
+        if len(parts) < 3:
             raise ValueError("lift: нет аргумента")
-        lift(int(parts[1]))
+        lift(int(parts[1]), int(parts[2]))
         return
 
     raise ValueError(f"неизвестная команда: {payload!r}")
