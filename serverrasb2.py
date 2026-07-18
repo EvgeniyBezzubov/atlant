@@ -7,7 +7,6 @@
   python3 rasb2_server.py
 """
 
-
 from __future__ import annotations
 
 import socket
@@ -26,10 +25,15 @@ INACTIVITY_SEC = 5.0  # без команд → пины в HIGH
 # --- GPIO ---
 GPIO.setmode(GPIO.BCM)
 GPIO.setwarnings(False)
-PIN_A = 20
-PIN_B = 21
-GPIO.setup(PIN_A, GPIO.OUT, initial=GPIO.HIGH)
-GPIO.setup(PIN_B, GPIO.OUT, initial=GPIO.HIGH)
+PIN_5 = 5
+PIN_6 = 6
+PIN_20 = 20
+PIN_21 = 21
+GPIO.setup(PIN_5, GPIO.OUT, initial=GPIO.HIGH)
+GPIO.setup(PIN_5, GPIO.OUT, initial=GPIO.HIGH)
+
+GPIO.setup(PIN_20, GPIO.OUT, initial=GPIO.HIGH)
+GPIO.setup(PIN_21, GPIO.OUT, initial=GPIO.HIGH)
 
 # --- состояние ---
 last_command_time = time.time()
@@ -122,35 +126,49 @@ def update_last_command_time() -> None:
 
 def set_pins_safe() -> None:
     with gpio_lock:
-        GPIO.output(PIN_A, GPIO.HIGH)
-        GPIO.output(PIN_B, GPIO.HIGH)
+        GPIO.output(PIN_5, GPIO.HIGH)
+        GPIO.output(PIN_6, GPIO.HIGH)
+        GPIO.output(PIN_20, GPIO.HIGH)
+        GPIO.output(PIN_21, GPIO.HIGH)
 
 
 def elevator(arg: int) -> None:
     with gpio_lock:
         if arg == 0:
-            GPIO.output(PIN_A, GPIO.HIGH)
-            GPIO.output(PIN_B, GPIO.HIGH)
+            GPIO.output(PIN_20, GPIO.HIGH)
+            GPIO.output(PIN_21, GPIO.HIGH)
         elif arg == 1:
-            GPIO.output(PIN_A, GPIO.LOW)
-            GPIO.output(PIN_B, GPIO.HIGH)
+            GPIO.output(PIN_20, GPIO.LOW)
+            GPIO.output(PIN_21, GPIO.HIGH)
         elif arg == 2:
-            GPIO.output(PIN_A, GPIO.HIGH)
-            GPIO.output(PIN_B, GPIO.HIGH)
+            GPIO.output(PIN_20, GPIO.HIGH)
+            GPIO.output(PIN_21, GPIO.HIGH)
         elif arg == 3:
-            GPIO.output(PIN_A, GPIO.HIGH)
-            GPIO.output(PIN_B, GPIO.LOW)
+            GPIO.output(PIN_20, GPIO.HIGH)
+            GPIO.output(PIN_21, GPIO.LOW)
         else:
             raise ValueError(f"elevator: неизвестное положение {arg}")
     print(f"elevator -> {arg}")
 
 
-def lift(arg: int) -> None:
-    """
-    Подъёмники на этой Pi — если пины другие, допишите GPIO здесь.
-    Пока только логируем, чтобы клиентский ACK не ломался.
-    """
-    print(f"lift -> {arg} (GPIO для lift не заданы в этом файле)")
+def lift(pos, time) -> None:
+
+    with gpio_lock:
+        if pos == 1:
+            GPIO.output(PIN_5, GPIO.LOW)
+            GPIO.output(PIN_6, GPIO.HIGH)
+            time.sleep(time)
+            GPIO.output(PIN_5, GPIO.HIGH)
+            GPIO.output(PIN_6, GPIO.HIGH)
+        if pos == -1:
+            GPIO.output(PIN_5, GPIO.HIGH)
+            GPIO.output(PIN_6, GPIO.LOW)
+            time.sleep(time)
+            GPIO.output(PIN_5, GPIO.HIGH)
+            GPIO.output(PIN_6, GPIO.HIGH)
+        else:
+            raise ValueError(f"elevator: неизвестное положение {arg}")
+    print(f"lift -> {pos} (GPIO для lift не заданы в этом файле)")
 
 
 def dispatch(payload: str) -> None:
