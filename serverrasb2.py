@@ -7,6 +7,7 @@
   python3 rasb2_server.py
 """
 
+
 from __future__ import annotations
 
 import socket
