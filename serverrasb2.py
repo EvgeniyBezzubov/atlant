@@ -1,102 +1,284 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
+"""
+Сервер Raspberry Pi (rasb2): элеватор / lift / ONLINE.
+Постоянное TCP-соединение, cmd_id, ответы OK|id / DUP|id.
+
+Скопируйте этот файл на Pi и запустите:
+  python3 rasb2_server.py
+"""
+
+from __future__ import annotations
+
 import socket
-import RPi.GPIO as GPIO
-import time
 import threading
-from _thread import *
+import time
+from typing import Optional
 
-# Глобальная переменная для отслеживания времени последней команды
+import RPi.GPIO as GPIO
+
+# --- сеть ---
+HOST = "192.168.0.169"
+PORT = 12346
+IDLE_CONN_TIMEOUT = 90.0  # закрыть клиента, если молчит дольше (ONLINE держит живым)
+INACTIVITY_SEC = 5.0  # без команд → пины в HIGH
+
+# --- GPIO ---
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+PIN_A = 20
+PIN_B = 21
+GPIO.setup(PIN_A, GPIO.OUT, initial=GPIO.HIGH)
+GPIO.setup(PIN_B, GPIO.OUT, initial=GPIO.HIGH)
+
+# --- состояние ---
 last_command_time = time.time()
-# Блокировка для безопасного доступа к глобальной переменной из разных потоков
 command_time_lock = threading.Lock()
-# Флаг для остановки потока мониторинга
 monitoring_active = True
+gpio_lock = threading.Lock()
 
 
-def update_last_command_time():
-    """Обновляет время последней полученной команды"""
+# ---------- идемпотентность / разбор протокола ----------
+
+class IdempotencyCache:
+    def __init__(self, ttl_sec: float = 600.0, max_size: int = 5000):
+        self.ttl_sec = ttl_sec
+        self.max_size = max_size
+        self._lock = threading.Lock()
+        self._items: dict[str, float] = {}
+
+    def is_duplicate(self, cmd_id: Optional[str]) -> bool:
+        if not cmd_id:
+            return False
+        now = time.time()
+        with self._lock:
+            self._purge(now)
+            return cmd_id in self._items
+
+    def remember(self, cmd_id: Optional[str]) -> None:
+        if not cmd_id:
+            return
+        now = time.time()
+        with self._lock:
+            self._purge(now)
+            self._items[cmd_id] = now
+            overflow = len(self._items) - self.max_size
+            if overflow > 0:
+                for k, _ in sorted(self._items.items(), key=lambda kv: kv[1])[:overflow]:
+                    self._items.pop(k, None)
+
+    def _purge(self, now: float) -> None:
+        dead = [k for k, t in self._items.items() if now - t > self.ttl_sec]
+        for k in dead:
+            del self._items[k]
+
+
+ID_CACHE = IdempotencyCache()
+
+
+def parse_client_line(raw: bytes) -> tuple[Optional[str], str]:
+    text = raw.decode(errors="replace").strip()
+    if not text:
+        return None, ""
+    if text.startswith("id=") and "|" in text:
+        head, payload = text.split("|", 1)
+        return head[3:].strip() or None, payload.strip()
+    tokens = text.split()
+    cmd_id = None
+    payload_tokens = []
+    for tok in tokens:
+        if tok.startswith("id=") and len(tok) > 3:
+            cmd_id = tok[3:]
+        else:
+            payload_tokens.append(tok)
+    return cmd_id, " ".join(payload_tokens)
+
+
+def format_ack(cmd_id: Optional[str], duplicate: bool = False) -> bytes:
+    tag = "DUP" if duplicate else "OK"
+    if cmd_id:
+        return f"{tag}|{cmd_id}\n".encode()
+    return f"{tag}\n".encode()
+
+
+def enable_keepalive(sock: socket.socket) -> None:
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    if hasattr(socket, "TCP_KEEPIDLE"):
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 10)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 3)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+        except OSError:
+            pass
+
+
+# ---------- логика устройства ----------
+
+def update_last_command_time() -> None:
     global last_command_time
     with command_time_lock:
         last_command_time = time.time()
 
 
-def monitor_inactivity():
-    """Мониторит отсутствие команд и переключает пины в HIGH при бездействии"""
-    global monitoring_active
-    global last_command_time
-    # Список всех используемых GPIO пинов
-    all_gpio_pins = [GPIO20, GPIO21]
+def set_pins_safe() -> None:
+    with gpio_lock:
+        GPIO.output(PIN_A, GPIO.HIGH)
+        GPIO.output(PIN_B, GPIO.HIGH)
 
+
+def elevator(arg: int) -> None:
+    with gpio_lock:
+        if arg == 0:
+            GPIO.output(PIN_A, GPIO.HIGH)
+            GPIO.output(PIN_B, GPIO.HIGH)
+        elif arg == 1:
+            GPIO.output(PIN_A, GPIO.LOW)
+            GPIO.output(PIN_B, GPIO.HIGH)
+        elif arg == 2:
+            GPIO.output(PIN_A, GPIO.HIGH)
+            GPIO.output(PIN_B, GPIO.HIGH)
+        elif arg == 3:
+            GPIO.output(PIN_A, GPIO.HIGH)
+            GPIO.output(PIN_B, GPIO.LOW)
+        else:
+            raise ValueError(f"elevator: неизвестное положение {arg}")
+    print(f"elevator -> {arg}")
+
+
+def lift(arg: int) -> None:
+    """
+    Подъёмники на этой Pi — если пины другие, допишите GPIO здесь.
+    Пока только логируем, чтобы клиентский ACK не ломался.
+    """
+    print(f"lift -> {arg} (GPIO для lift не заданы в этом файле)")
+
+
+def dispatch(payload: str) -> None:
+    parts = payload.split()
+    if not parts:
+        return
+    cmd = parts[0].lower()
+
+    if cmd == "online":
+        return
+
+    if cmd == "elevator":
+        if len(parts) < 2:
+            raise ValueError("elevator: нет аргумента")
+        elevator(int(parts[1]))
+        return
+
+    if cmd == "lift":
+        if len(parts) < 2:
+            raise ValueError("lift: нет аргумента")
+        lift(int(parts[1]))
+        return
+
+    raise ValueError(f"неизвестная команда: {payload!r}")
+
+
+def monitor_inactivity() -> None:
+    global monitoring_active, last_command_time
     while monitoring_active:
-        time.sleep(1)  # Проверяем каждую секунду
+        time.sleep(1)
         with command_time_lock:
-            time_since_last_command = time.time() - last_command_time
-
-        if time_since_last_command >= 5:
-            # Переключаем все пины в HIGH
-            for pin in all_gpio_pins:
-                GPIO.output(pin, GPIO.HIGH)
-            # Сбрасываем время, чтобы не повторять переключение постоянно
+            idle = time.time() - last_command_time
+        if idle >= INACTIVITY_SEC:
+            set_pins_safe()
             with command_time_lock:
                 last_command_time = time.time()
-            print("No commands received for 5 seconds. All pins set to HIGH")
+            print(f"No commands for {INACTIVITY_SEC:.0f}s — pins HIGH")
 
 
-def client_thread(con):
-    data = con.recv(1024)
-    message = data.decode()
-    datalist = message.split(" ")
-    print(datalist)
+# ---------- TCP: постоянное соединение ----------
 
-    # Обновляем время при получении любой команды
+def process_line(conn: socket.socket, line: bytes) -> None:
+    if not line.strip():
+        return
+
+    cmd_id, payload = parse_client_line(line)
     update_last_command_time()
+    print(f"<= {payload!r} id={cmd_id}")
 
-    if datalist[0] == "elevator":
-        elevator(int(datalist[1]))
+    if cmd_id and ID_CACHE.is_duplicate(cmd_id):
+        conn.sendall(format_ack(cmd_id, duplicate=True))
+        print(f"=> DUP|{cmd_id}")
+        return
 
-    messageout = datalist[0][::-1]
-    con.send(messageout.encode())
-    con.close()
-
-
-def elevator(arg):
-    if arg == 0:
-        GPIO.output(GPIO20, GPIO.HIGH)
-        GPIO.output(GPIO21, GPIO.HIGH)
-    elif arg == 1:
-        GPIO.output(GPIO20, GPIO.LOW)
-        GPIO.output(GPIO21, GPIO.HIGH)
-    elif arg == 2:
-        GPIO.output(GPIO20, GPIO.HIGH)
-        GPIO.output(GPIO21, GPIO.HIGH)
-    elif arg == 3:
-        GPIO.output(GPIO20, GPIO.HIGH)
-        GPIO.output(GPIO21, GPIO.LOW)
+    try:
+        dispatch(payload)
+        ID_CACHE.remember(cmd_id)
+        conn.sendall(format_ack(cmd_id, duplicate=False))
+        print(f"=> OK|{cmd_id or ''}")
+    except Exception as e:
+        err = f"ERR|{cmd_id or ''}|{e}\n"
+        conn.sendall(err.encode())
+        print(f"=> {err.strip()}")
 
 
-GPIO.setmode(GPIO.BCM)
-GPIO20 = 20
-GPIO21 = 21 
-GPIO.setup(GPIO20, GPIO.OUT)
-GPIO.output(GPIO20, GPIO.HIGH)
+def handle_client(conn: socket.socket, addr) -> None:
+    print(f"client connected: {addr}")
+    enable_keepalive(conn)
+    conn.settimeout(IDLE_CONN_TIMEOUT)
+    buf = b""
+    try:
+        while True:
+            try:
+                chunk = conn.recv(1024)
+            except socket.timeout:
+                print(f"client idle timeout: {addr}")
+                break
 
-GPIO.setup(GPIO21, GPIO.OUT)
-GPIO.output(GPIO21, GPIO.HIGH)
+            if not chunk:
+                # старый клиент мог не прислать \n — добить хвост буфера
+                if buf.strip():
+                    process_line(conn, buf)
+                    buf = b""
+                break
 
-# Запускаем поток мониторинга бездействия
-monitoring_thread = threading.Thread(target=monitor_inactivity, daemon=True)
-monitoring_thread.start()
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                process_line(conn, line)
 
-server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-# hostname = "192.168.8.4"
-hostname = "192.168.0.169"
-print(hostname)
-port = 12346
-server.bind((hostname, port))
-server.listen(5)
+    except ConnectionResetError:
+        print(f"client reset: {addr}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        print(f"client closed: {addr}")
 
-print("servet run")
 
-while True:
-    client, _ = server.accept()
-    start_new_thread(client_thread, (client,))
+def main() -> None:
+    monitor = threading.Thread(target=monitor_inactivity, daemon=True)
+    monitor.start()
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    enable_keepalive(server)
+    server.bind((HOST, PORT))
+    server.listen(8)
+    print(f"server run on {HOST}:{PORT} (persistent)")
+
+    try:
+        while True:
+            client, addr = server.accept()
+            threading.Thread(
+                target=handle_client, args=(client, addr), daemon=True
+            ).start()
+    except KeyboardInterrupt:
+        print("stopping...")
+    finally:
+        global monitoring_active
+        monitoring_active = False
+        try:
+            server.close()
+        except Exception:
+            pass
+        set_pins_safe()
+        GPIO.cleanup()
+
+
+if __name__ == "__main__":
+    main()
