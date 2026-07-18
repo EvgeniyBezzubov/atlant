@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """
 Сервер Raspberry Pi (rasb2): элеватор / lift / ONLINE.
 Постоянное TCP-соединение, cmd_id, ответы OK|id / DUP|id.
