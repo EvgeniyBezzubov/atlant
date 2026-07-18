@@ -194,7 +194,6 @@ def dispatch(payload: str) -> None:
 
     raise ValueError(f"неизвестная команда: {payload!r}")
 
-
 def monitor_inactivity() -> None:
     global monitoring_active, last_command_time
     while monitoring_active:
