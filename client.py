@@ -260,13 +260,13 @@ class ReliableLink:
 
 # --- сеть ---
 hostname = "37.9.243.135"
-hostname_local_rasb_1 = "192.168.8.4"
-hostname_local_rasb_2 = "192.168.0.169"
+hostname_local_rasb_1 = "192.168.0.169"
+hostname_local_rasb_2 = "192.168.0.168"
 port = 12345
 port2 = 12346
 
-# rasb1 — пока one_shot (старый сервер); rasb2 — постоянное соединение
-link_rasb1 = ReliableLink(hostname_local_rasb_1, port, name="rasb1", one_shot=True)
+# rasb1 / rasb2 — постоянное соединение, OK|id / DUP|id
+link_rasb1 = ReliableLink(hostname_local_rasb_1, port, name="rasb1", one_shot=False)
 link_rasb2 = ReliableLink(hostname_local_rasb_2, port2, name="rasb2", one_shot=False)
 
 filtrochistki_isOn = True
@@ -284,15 +284,19 @@ def lift(arg_lift, time_on):
     )
 
 
-def startUs(arg_us, pos):
-    message = "startUs" + str(arg_us) + " " + str(pos)
-    print(message)
-    ok = link_rasb1.send(
-        message,
-        wait=True,
-        coalesce_key=f"startUs{arg_us}",
-    )
-    print("startUs ACK" if ok else "startUs FAIL")
+def set_pump(state):
+    """Помпа: state 0/1."""
+    ok = link_rasb1.send(f"pump {state}", wait=True, coalesce_key="pump")
+    print("pump ACK" if ok else "pump FAIL")
+    return ok
+
+
+def set_mustache(state):
+    """Усы (оба канала): state 0/1."""
+    ok_a = link_rasb1.send(f"mustache_a {state}", wait=True, coalesce_key="mustache_a")
+    ok_b = link_rasb1.send(f"mustache_b {state}", wait=True, coalesce_key="mustache_b")
+    ok = ok_a and ok_b
+    print("mustache ACK" if ok else "mustache FAIL")
     return ok
 
 
@@ -313,9 +317,9 @@ def Start_filtr_ochistki():
     while True:
         if filtrochistki_isOn:
             time.sleep(periodvkl)
-            link_rasb1.send("relle1pos 0", wait=True, coalesce_key="relle1")
+            link_rasb1.send("filter_relay 0", wait=True, coalesce_key="filter_relay")
             time.sleep(timeon)
-            link_rasb1.send("relle1pos 1", wait=True, coalesce_key="relle1")
+            link_rasb1.send("filter_relay 1", wait=True, coalesce_key="filter_relay")
             time.sleep(1)
         else:
             time.sleep(0.5)
@@ -348,58 +352,53 @@ def wake_UP():
         print("Расбери 2 офлайн")
 
 
-def revers2_left(revers_gear2):
+def set_reverse_left(direction):
     ok = link_rasb1.send(
-        "revers2 " + str(revers_gear2),
+        f"reverse_left {direction}",
         wait=True,
-        coalesce_key="revers2",
+        coalesce_key="reverse_left",
     )
     if not ok:
-        print("Попытка Установки реверса 2 неудачна")
+        print("Попытка установки реверса левого двигателя неудачна")
 
 
-def revers1_right(revers_gear1):
+def set_reverse_right(direction):
     ok = link_rasb1.send(
-        "revers1 " + str(revers_gear1),
+        f"reverse_right {direction}",
         wait=True,
-        coalesce_key="revers1",
+        coalesce_key="reverse_right",
     )
     if not ok:
-        print("Попытка Установки реверса 1 неудачна")
+        print("Попытка установки реверса правого двигателя неудачна")
 
 
-def swapgear_1engine_right(arg):
+def set_gear_right(arg):
+    """UI level -3..+3 → gear_right 0..3 + reverse_right."""
     global gear
-    gear = int(arg)
-    if gear <= 0:
-        gear = -1 * gear + 2
-        revers_gear = 1
+    level = int(arg)
+    if level <= 0:
+        gear = abs(level)  # 0→0, -1→1, -2→2, -3→3
+        reverse_dir = 1
     else:
-        gear = gear + 2
-        revers_gear = -1
-    if gear <= 2:
-        gear = 0
+        gear = level  # 1→1, 2→2, 3→3
+        reverse_dir = -1
     print(gear)
-    Thread(target=revers1_right, args=(revers_gear,), daemon=True).start()
-
-    message = "start1gear" + str(gear)
-    link_rasb1.send(message, wait=True, coalesce_key="start1gear")
+    Thread(target=set_reverse_right, args=(reverse_dir,), daemon=True).start()
+    link_rasb1.send(f"gear_right {gear}", wait=True, coalesce_key="gear_right")
 
 
-def swapgear_2engine_left(arg):
-    gear = int(arg)
-    if gear <= 0:
-        gear = -1 * gear + 2
-        revers_gear = 1
+def set_gear_left(arg):
+    """UI level -3..+3 → gear_left 0..3 + reverse_left."""
+    level = int(arg)
+    if level <= 0:
+        gear = abs(level)  # 0→0, -1→1, -2→2, -3→3
+        reverse_dir = 1
     else:
-        gear = gear + 2
-        revers_gear = -1
-    if gear <= 2:
-        gear = 0
-    Thread(target=revers2_left, args=(revers_gear,), daemon=True).start()
+        gear = level  # 1→1, 2→2, 3→3
+        reverse_dir = -1
+    Thread(target=set_reverse_left, args=(reverse_dir,), daemon=True).start()
     print(gear)
-    message = "start2gear" + str(gear)
-    link_rasb1.send(message, wait=True, coalesce_key="start2gear")
+    link_rasb1.send(f"gear_left {gear}", wait=True, coalesce_key="gear_left")
 
 
 def create_squares():
@@ -708,13 +707,8 @@ def create_squares():
 
             canvas.itemconfig(right_shapes[i], fill=color)
 
-        slow_swapgear_1engine_right = swapgear_1engine_right
-        slowfTread_swapgear_1engine = Thread(target=slow_swapgear_1engine_right, args=(right_level,))
-        slowfTread_swapgear_1engine.start()
-
-        slow_swapgear_2engine_left = swapgear_2engine_left
-        slowfTread_swapgear_2engine = Thread(target=slow_swapgear_2engine_left, args=(left_level,))
-        slowfTread_swapgear_2engine.start()
+        Thread(target=set_gear_right, args=(right_level,), daemon=True).start()
+        Thread(target=set_gear_left, args=(left_level,), daemon=True).start()
 
         # Вывод статуса передач
         left_status = {-3: "3 назад", -2: "2 назад", -1: "1 назад", 0: "нейтраль",
@@ -841,8 +835,7 @@ def create_squares():
         print(f"Усы: {['красный', 'зелёный'][level]}")
 
         def worker():
-            startUs("3", level)
-            startUs("4", level)
+            set_mustache(level)
 
         Thread(target=worker, daemon=True).start()
 
@@ -910,7 +903,7 @@ def create_squares():
         level = pump_level
         update_circle(3, level, "2state")
         print(f"Помпа: {['красный', 'зелёный'][level]}")
-        Thread(target=startUs, args=("1", level), daemon=True).start()
+        Thread(target=set_pump, args=(level,), daemon=True).start()
 
     def on_filter_key():
         nonlocal filter_level, filter_interval, filter_period, dialog_active
@@ -950,9 +943,7 @@ def create_squares():
 
     def gear1():
         gear = input("Enter your name: ")
-        slow_swapgear_2engine_left = swapgear_2engine_left
-        slowfTread_swapgear_2engine = Thread(target=slow_swapgear_2engine_left, args=(gear,))
-        slowfTread_swapgear_2engine.start()
+        Thread(target=set_gear_left, args=(gear,), daemon=True).start()
 
     # Регистрируем горячие клавиши
     keyboard.add_hotkey("up", on_up)
