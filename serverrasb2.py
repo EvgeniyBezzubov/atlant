@@ -17,7 +17,7 @@ from typing import Optional
 import RPi.GPIO as GPIO
 
 # --- сеть ---
-HOST = "192.168.0.169"
+HOST = "192.168.0.168"
 PORT = 12346
 IDLE_CONN_TIMEOUT = 90.0  # закрыть клиента, если молчит дольше (ONLINE держит живым)
 INACTIVITY_SEC = 5.0  # без команд → пины в HIGH
