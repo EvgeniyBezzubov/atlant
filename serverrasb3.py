@@ -30,8 +30,7 @@ PIN_6 = 6
 PIN_20 = 20
 PIN_21 = 21
 GPIO.setup(PIN_5, GPIO.OUT, initial=GPIO.HIGH)
-GPIO.setup(PIN_5, GPIO.OUT, initial=GPIO.HIGH)
-
+GPIO.setup(PIN_6, GPIO.OUT, initial=GPIO.HIGH)
 GPIO.setup(PIN_20, GPIO.OUT, initial=GPIO.HIGH)
 GPIO.setup(PIN_21, GPIO.OUT, initial=GPIO.HIGH)
 
@@ -152,22 +151,28 @@ def elevator(arg: int) -> None:
 
 
 def lift(pos: int, duration_sec: float) -> None:
+    """Импульс: LOW на duration_sec, затем всегда оба пина HIGH."""
+    if duration_sec <= 0:
+        raise ValueError(f"lift: время должно быть > 0, получено {duration_sec}")
+
     with gpio_lock:
-        if pos == 1:
-            GPIO.output(PIN_5, GPIO.LOW)
-            GPIO.output(PIN_6, GPIO.HIGH)
+        try:
+            if pos == 1:
+                GPIO.output(PIN_5, GPIO.LOW)
+                GPIO.output(PIN_6, GPIO.HIGH)
+            elif pos == -1:
+                GPIO.output(PIN_5, GPIO.HIGH)
+                GPIO.output(PIN_6, GPIO.LOW)
+            else:
+                raise ValueError(f"lift: неизвестное положение {pos}")
+
             time.sleep(duration_sec)
+        finally:
+            # даже при ошибке/прерывании пины гасим
             GPIO.output(PIN_5, GPIO.HIGH)
             GPIO.output(PIN_6, GPIO.HIGH)
-        elif pos == -1:
-            GPIO.output(PIN_5, GPIO.HIGH)
-            GPIO.output(PIN_6, GPIO.LOW)
-            time.sleep(duration_sec)
-            GPIO.output(PIN_5, GPIO.HIGH)
-            GPIO.output(PIN_6, GPIO.HIGH)
-        else:
-            raise ValueError(f"lift: неизвестное положение {pos}")
-    print(f"lift -> {pos} for {duration_sec}s")
+
+    print(f"lift -> {pos} for {duration_sec}s (pins HIGH)")
 
 
 def dispatch(payload: str) -> None:
@@ -213,7 +218,9 @@ def process_line(conn: socket.socket, line: bytes) -> None:
         return
 
     cmd_id, payload = parse_client_line(line)
-    update_last_command_time()
+    # ONLINE не продлевает таймер бездействия — иначе залипшие пины lift никогда не сбросятся
+    if payload.strip().upper() != "ONLINE":
+        update_last_command_time()
     print(f"<= {payload!r} id={cmd_id}")
 
     if cmd_id and ID_CACHE.is_duplicate(cmd_id):
