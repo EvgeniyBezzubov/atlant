@@ -275,8 +275,8 @@ timeon = 0.5
 
 
 def lift(arg_lift, time_on):
-    """Отправляет команду подъёмникам. True — сервер подтвердил (OK/DUP/любой ACK)."""
-    message = "lift " + str(arg_lift)
+    """Отправляет команду подъёмникам: lift <направление> <секунды>."""
+    message = f"lift {arg_lift} {time_on}"
     return link_rasb2.send(
         message,
         wait=True,
@@ -292,16 +292,15 @@ def set_pump(state):
 
 
 def set_mustache(state):
-    """Усы (оба канала): state 0/1."""
-    ok_a = link_rasb1.send(f"mustache_a {state}", wait=True, coalesce_key="mustache_a")
-    ok_b = link_rasb1.send(f"mustache_b {state}", wait=True, coalesce_key="mustache_b")
-    ok = ok_a and ok_b
+    """Усы: state 0/1 (только GPIO8 на rasb1)."""
+    ok = link_rasb1.send(f"mustache {state}", wait=True, coalesce_key="mustache")
     print("mustache ACK" if ok else "mustache FAIL")
     return ok
 
 
 def run_elevator_new(polozhenie):
     message = "elevator " + str(polozhenie)
+    print(str(polozhenie))
     ok = link_rasb2.send(
         message,
         wait=True,
@@ -417,8 +416,8 @@ def create_squares():
     circle_size = 25
     circle_spacing = 45  # Расстояние между кружками по вертикали
 
-    # Состояния элементов (4 состояния для элеватора: 0-серый1, 1-зелёный, 2-серый2, 3-красный)
-    elevator_level = 1  # 0 - серый, 1 - серый, 2 - зелёный, 3 - красный
+    # Состояния элементов (элеватор: 0/2=стоп, 1=вперёд, 3=назад)
+    elevator_level = 2  # старт в стопе (как arg==2 на сервере)
     mustache_level = 0  # 0 - красный, 1 - зелёный
     lift_level = 0  # 0 - красный, 1 - зелёный
     # Последняя успешно выполненная команда подъёмников: None | "up" | "down"
@@ -800,32 +799,85 @@ def create_squares():
         right_level = 0
         update_squares()
 
+    def on_left_up():
+        """7 — повысить скорость только левой части."""
+        nonlocal left_level
+        if left_level < 3:
+            left_level += 1
+        update_squares()
+
+    def on_left_down():
+        """1 — понизить скорость только левой части."""
+        nonlocal left_level
+        if left_level > -3:
+            left_level -= 1
+        update_squares()
+
+    def on_right_up():
+        """9 — повысить скорость только правой части."""
+        nonlocal right_level
+        if right_level < 3:
+            right_level += 1
+        update_squares()
+
+    def on_right_down():
+        """3 — понизить скорость только правой части."""
+        nonlocal right_level
+        if right_level > -3:
+            right_level -= 1
+        update_squares()
+
     def on_elevator_key():
+        """E — вперёд (1). Если уже едем или было назад — сначала/только стоп (оба HIGH)."""
         nonlocal elevator_level
-        # При первом нажатии: останавливаем элеватор (серый цвет, elevator_level = 1)
-        # При повторном нажатии: запускаем в положение 2
-        # Следующие нажатия: двигаемся в диапазоне 1-2
-        elevator_level = (elevator_level + 1) % 4
-        elevator_status_num = [1, 2, 1, 2]
 
-        update_circle(0, elevator_status_num[elevator_level], "4state")
-        slow_run_elevator_new = run_elevator_new
-        slowfTread_slow_run_elevator_new = Thread(target=slow_run_elevator_new,
-                                                  args=(elevator_status_num[elevator_level],))
-        slowfTread_slow_run_elevator_new.start()
+        if elevator_level == 1:
+            # повтор E: стоп
+            elevator_level = 2
+            update_circle(0, elevator_level, "4state")
+            print("Элеватор: стоп (2) — оба HIGH")
+            Thread(target=run_elevator_new, args=(2,), daemon=True).start()
+            return
 
-    # Исправленная функция on_elevator_key_down
+        if elevator_level == 3:
+            # было назад (R) → только стоп, оба HIGH (не стартуем вперёд)
+            elevator_level = 2
+            update_circle(0, elevator_level, "4state")
+            print("Элеватор: после R → стоп (2) — оба HIGH")
+            Thread(target=run_elevator_new, args=(2,), daemon=True).start()
+            return
+
+        # стоп → вперёд (PIN_20 LOW)
+        elevator_level = 1
+        update_circle(0, elevator_level, "4state")
+        print("Элеватор: вперёд (1)")
+        Thread(target=run_elevator_new, args=(1,), daemon=True).start()
+
     def on_elevator_key_down():
+        """R — назад (3). Если уже едем или было вперёд — сначала/только стоп (оба HIGH)."""
         nonlocal elevator_level
-        elevator_level = (elevator_level + 1) % 4
-        elevator_status_num = [1, 0, 1, 0]
-        # При первом нажатии: переводим в положение elevator_level = 2
-        # Следующие нажатия: двигаемся в диапазоне 2-3
-        update_circle(0, elevator_status_num[elevator_level], "4state")
-        slow_run_elevator_new = run_elevator_new
-        slowfTread_slow_run_elevator_new = Thread(target=slow_run_elevator_new,
-                                                  args=(elevator_status_num[elevator_level],))
-        slowfTread_slow_run_elevator_new.start()
+
+        if elevator_level == 3:
+            # повтор R: стоп
+            elevator_level = 0
+            update_circle(0, elevator_level, "4state")
+            print("Элеватор: стоп (0) — оба HIGH")
+            Thread(target=run_elevator_new, args=(0,), daemon=True).start()
+            return
+
+        if elevator_level == 1:
+            # было вперёд (E) → только стоп, оба HIGH (не стартуем назад)
+            elevator_level = 0
+            update_circle(0, elevator_level, "4state")
+            print("Элеватор: после E → стоп (0) — оба HIGH")
+            Thread(target=run_elevator_new, args=(0,), daemon=True).start()
+            return
+
+        # стоп → назад (PIN_21 LOW)
+        elevator_level = 3
+        update_circle(0, elevator_level, "4state")
+        print("Элеватор: назад (3)")
+        Thread(target=run_elevator_new, args=(3,), daemon=True).start()
 
     def on_mustache_key():
         nonlocal mustache_level
@@ -941,16 +993,16 @@ def create_squares():
     def on_esc():
         root.destroy()
 
-    def gear1():
-        gear = input("Enter your name: ")
-        Thread(target=set_gear_left, args=(gear,), daemon=True).start()
-
     # Регистрируем горячие клавиши
     keyboard.add_hotkey("up", on_up)
     keyboard.add_hotkey("down", on_down)
     keyboard.add_hotkey("right", on_right)
     keyboard.add_hotkey("left", on_left)
     keyboard.add_hotkey("space", on_space)
+    keyboard.add_hotkey("7", on_left_up)
+    keyboard.add_hotkey("1", on_left_down)
+    keyboard.add_hotkey("9", on_right_up)
+    keyboard.add_hotkey("3", on_right_down)
     keyboard.add_hotkey("e", on_elevator_key)
     keyboard.add_hotkey("r", on_elevator_key_down)
     keyboard.add_hotkey("y", on_mustache_key)
@@ -960,7 +1012,6 @@ def create_squares():
     keyboard.add_hotkey("f", on_filter_key)
     keyboard.add_hotkey("n", on_network_voltage_key)
     keyboard.add_hotkey("esc", on_esc)
-    keyboard.add_hotkey("1", gear1)
 
     print("Программа запущена!")
     print("=" * 70)
@@ -970,9 +1021,14 @@ def create_squares():
     print('➡️ Стрелка "RIGHT" - правый +1, левый -1')
     print('⬅️ Стрелка "LEFT" - правый -1, левый +1')
     print('␣ ПРОБЕЛ "SPACE" - сброс обоих блоков на уровень 0')
+    print('"7" - повысить только ЛЕВЫЙ блок (+1)')
+    print('"1" - понизить только ЛЕВЫЙ блок (-1)')
+    print('"9" - повысить только ПРАВЫЙ блок (+1)')
+    print('"3" - понизить только ПРАВЫЙ блок (-1)')
     print("=" * 70)
     print("УПРАВЛЕНИЕ ДОПОЛНИТЕЛЬНЫМИ ЭЛЕМЕНТАМИ:")
-    print('🟡 "E, R" - переключение ЭЛЕВАТОРА (серый→зелёный→серый→красный)')
+    print('🟡 "E" - вперёд (1); если ехали назад — только стоп (оба HIGH)')
+    print('🟡 "R" - назад (3); если ехали вперёд — только стоп (оба HIGH)')
     print('🟡 "Y" - переключение УСОВ (красный↔зелёный)')
     print('🟡 "U" - переключение ПОДЪЁМНИКОВ (красный↔зелёный)')
     print('🟡 "P" - переключение ПОМПЫ (красный↔зелёный)')

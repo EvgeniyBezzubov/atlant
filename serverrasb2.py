@@ -151,24 +151,23 @@ def elevator(arg: int) -> None:
     print(f"elevator -> {arg}")
 
 
-def lift(pos, time) -> None:
-
+def lift(pos: int, duration_sec: float) -> None:
     with gpio_lock:
         if pos == 1:
             GPIO.output(PIN_5, GPIO.LOW)
             GPIO.output(PIN_6, GPIO.HIGH)
-            time.sleep(time)
+            time.sleep(duration_sec)
             GPIO.output(PIN_5, GPIO.HIGH)
             GPIO.output(PIN_6, GPIO.HIGH)
-        if pos == -1:
+        elif pos == -1:
             GPIO.output(PIN_5, GPIO.HIGH)
             GPIO.output(PIN_6, GPIO.LOW)
-            time.sleep(time)
+            time.sleep(duration_sec)
             GPIO.output(PIN_5, GPIO.HIGH)
             GPIO.output(PIN_6, GPIO.HIGH)
         else:
-            raise ValueError(f"elevator: неизвестное положение {arg}")
-    print(f"lift -> {pos} (GPIO для lift не заданы в этом файле)")
+            raise ValueError(f"lift: неизвестное положение {pos}")
+    print(f"lift -> {pos} for {duration_sec}s")
 
 
 def dispatch(payload: str) -> None:
@@ -188,8 +187,8 @@ def dispatch(payload: str) -> None:
 
     if cmd == "lift":
         if len(parts) < 3:
-            raise ValueError("lift: нет аргумента")
-        lift(int(parts[1]), int(parts[2]))
+            raise ValueError("lift: нужны направление и время, пример: lift 1 1")
+        lift(int(parts[1]), float(parts[2]))
         return
 
     raise ValueError(f"неизвестная команда: {payload!r}")

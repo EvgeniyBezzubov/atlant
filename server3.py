@@ -40,12 +40,11 @@ GPIO2 = 2  ###relle
 GPIO9 = 9  ###relle 3 nizhnie blok
 GPIO11 = 11  ###relle 6 nizhnie blok
 GPIO10 = 10  ### relle 10 niz
-GPIO07 = 7  ###relle 11 niz
 GPIO08 = 8  ###relle 12 niz
 GPIO15 = 15  ###relle 9 niz
 
 ALL_GPIO_PINS = [
-    GPIO10, GPIO07, GPIO08, GPIO15, GPIO4, GPIO17,
+    GPIO10, GPIO08, GPIO15, GPIO4, GPIO17,
     GPIO22, GPIO13, GPIO19, GPIO26, GPIO18,
     GPIO23, GPIO24, GPIO25, GPIO16, GPIO21, GPIO14,
     GPIO3, GPIO2, GPIO9, GPIO11,
@@ -152,16 +151,8 @@ def set_pins_safe() -> None:
             GPIO.output(pin, GPIO.HIGH)
 
 
-def set_mustache_b(state: int) -> None:
-    """Усы, канал B (GPIO7). state: 1=вкл, 0=выкл."""
-    if state == 1:
-        GPIO.output(GPIO07, GPIO.LOW)
-    elif state == 0:
-        GPIO.output(GPIO07, GPIO.HIGH)
-
-
-def set_mustache_a(state: int) -> None:
-    """Усы, канал A (GPIO8). state: 1=вкл, 0=выкл."""
+def set_mustache(state: int) -> None:
+    """Усы (GPIO8). state: 1=вкл, 0=выкл."""
     if state == 1:
         GPIO.output(GPIO08, GPIO.LOW)
     elif state == 0:
@@ -335,11 +326,12 @@ def dispatch(payload: str) -> None:
         if cmd == "spare_out":
             set_spare_out(_require_arg(parts, cmd))
             return
-        if cmd == "mustache_a":
-            set_mustache_a(_require_arg(parts, cmd))
+        if cmd == "mustache":
+            set_mustache(_require_arg(parts, cmd))
             return
-        if cmd == "mustache_b":
-            set_mustache_b(_require_arg(parts, cmd))
+        if cmd == "mustache_a":
+            # совместимость со старым клиентом
+            set_mustache(_require_arg(parts, cmd))
             return
 
     raise ValueError(f"неизвестная команда: {payload!r}")
