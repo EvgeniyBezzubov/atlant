@@ -124,6 +124,7 @@ def update_last_command_time() -> None:
 
 
 def set_pins_safe() -> None:
+    """Все пины в HIGH при отсутствии любых команд (включая ONLINE)."""
     with gpio_lock:
         GPIO.output(PIN_5, GPIO.HIGH)
         GPIO.output(PIN_6, GPIO.HIGH)
@@ -208,7 +209,7 @@ def monitor_inactivity() -> None:
             set_pins_safe()
             with command_time_lock:
                 last_command_time = time.time()
-            print(f"No commands for {INACTIVITY_SEC:.0f}s — pins HIGH")
+            print(f"No commands for {INACTIVITY_SEC:.0f}s — all pins HIGH")
 
 
 # ---------- TCP: постоянное соединение ----------
@@ -218,9 +219,7 @@ def process_line(conn: socket.socket, line: bytes) -> None:
         return
 
     cmd_id, payload = parse_client_line(line)
-    # ONLINE не продлевает таймер бездействия — иначе залипшие пины lift никогда не сбросятся
-    if payload.strip().upper() != "ONLINE":
-        update_last_command_time()
+    update_last_command_time()
     print(f"<= {payload!r} id={cmd_id}")
 
     if cmd_id and ID_CACHE.is_duplicate(cmd_id):

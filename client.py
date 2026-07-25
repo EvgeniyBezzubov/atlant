@@ -345,9 +345,21 @@ def Wake_On_Lan():
 
 
 def wake_UP():
-    if not link_rasb1.keepalive("ONLINE"):
+    """ONLINE на обе Pi параллельно — чтобы таймер бездействия на rasb2 не сбрасывался из‑за задержки rasb1."""
+    results = {}
+
+    def ping(name, link):
+        results[name] = link.keepalive("ONLINE")
+
+    t1 = Thread(target=ping, args=("rasb1", link_rasb1), daemon=True)
+    t2 = Thread(target=ping, args=("rasb2", link_rasb2), daemon=True)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    if not results.get("rasb1"):
         print("Расбери 1 офлайн")
-    if not link_rasb2.keepalive("ONLINE"):
+    if not results.get("rasb2"):
         print("Расбери 2 офлайн")
 
 
@@ -906,7 +918,7 @@ def create_squares():
             lift_busy = True
             try:
                 print("-1")
-                time_on = "1"
+                time_on = "4"
                 ok = lift("-1", time_on)
                 if ok:
                     lift_level = 0
@@ -935,7 +947,7 @@ def create_squares():
             lift_busy = True
             try:
                 print("1")
-                time_on = "1"
+                time_on = "4"
                 ok = lift("1",time_on)
                 if ok:
                     lift_level = 1
