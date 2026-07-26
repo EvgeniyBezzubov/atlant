@@ -26,8 +26,8 @@ from kivy.uix.widget import Widget
 
 # --- сеть: локаль и интернет (проброс портов на роутере) ---
 WAN_HOST = "37.9.243.135"
-LOCAL_RASB1_HOST = "192.168.8.6"
-LOCAL_RASB2_HOST = "192.168.8.17"
+LOCAL_RASB1_HOST = "192.168.8.17"
+LOCAL_RASB2_HOST = "192.168.8.6"
 RASB1_PORT = 12345
 RASB2_PORT = 12346
 
