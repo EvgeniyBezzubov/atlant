@@ -17,8 +17,8 @@ from typing import Optional
 import RPi.GPIO as GPIO
 
 # --- сеть ---
-# HOST = "0.0.0.0"  # все интерфейсы: LAN + проброс портов с роутера
-HOST = "192.168.8.17"
+HOST = "0.0.0.0"  # все интерфейсы: LAN + проброс портов с роутера
+# HOST = "192.168.8.20"
 PORT = 12346
 IDLE_CONN_TIMEOUT = 90.0  # закрыть клиента, если молчит дольше (ONLINE держит живым)
 INACTIVITY_SEC = 5.0  # без команд → пины в HIGH
