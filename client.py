@@ -233,6 +233,14 @@ class ReliableLink:
         print(f"[{self.name}] подключено к {self.host}:{self.port}")
         return sock
 
+    def set_endpoint(self, host: str, port: int) -> None:
+        """Смена хоста/порта с разрывом текущего сокета."""
+        with self._io_lock:
+            self.host = host
+            self.port = port
+            self._close_sock()
+        print(f"[{self.name}] endpoint → {host}:{port}")
+
     def _close_sock(self) -> None:
         if self._sock is not None:
             try:
@@ -258,29 +266,78 @@ class ReliableLink:
                 pass
 
 
-# --- сеть ---
-hostname = "37.9.243.135"
-hostname_local_rasb_1 = "192.168.0.169"
-hostname_local_rasb_2 = "192.168.0.168"
-port = 12345
-port2 = 12346
+# --- сеть: локальная LAN и внешний IP роутера (проброс портов) ---
+WAN_HOST = "37.9.243.135"
+# Локальные адреса Pi (как в port forwarding на роутере)
+LOCAL_RASB1_HOST = "192.168.8.6"
+LOCAL_RASB2_HOST = "192.168.8.17"
+PORT_RASB1 = 12345
+PORT_RASB2 = 12346
+
+# совместимость со старыми именами
+hostname = WAN_HOST
+hostname_local_rasb_1 = LOCAL_RASB1_HOST
+hostname_local_rasb_2 = LOCAL_RASB2_HOST
+port = PORT_RASB1
+port2 = PORT_RASB2
+
+use_wan = False  # False = локальная сеть, True = интернет через 37.9.243.135
 
 # rasb1 / rasb2 — постоянное соединение, OK|id / DUP|id
-link_rasb1 = ReliableLink(hostname_local_rasb_1, port, name="rasb1", one_shot=False)
-link_rasb2 = ReliableLink(hostname_local_rasb_2, port2, name="rasb2", one_shot=False)
+link_rasb1 = ReliableLink(LOCAL_RASB1_HOST, PORT_RASB1, name="rasb1", one_shot=False)
+link_rasb2 = ReliableLink(LOCAL_RASB2_HOST, PORT_RASB2, name="rasb2", one_shot=False)
+
+
+def current_endpoints():
+    """Текущие (host, port) для rasb1/rasb2."""
+    if use_wan:
+        return (WAN_HOST, PORT_RASB1), (WAN_HOST, PORT_RASB2)
+    return (LOCAL_RASB1_HOST, PORT_RASB1), (LOCAL_RASB2_HOST, PORT_RASB2)
+
+
+def apply_network_mode():
+    """Применить use_wan к обоим каналам."""
+    ep1, ep2 = current_endpoints()
+    link_rasb1.set_endpoint(*ep1)
+    link_rasb2.set_endpoint(*ep2)
+    mode = "ИНТЕРНЕТ" if use_wan else "ЛОКАЛЬ"
+    print(f"Режим сети: {mode} | rasb1 {ep1[0]}:{ep1[1]} | rasb2 {ep2[0]}:{ep2[1]}")
+    return mode, ep1, ep2
+
+
+def toggle_network_mode():
+    """Переключить локаль ↔ интернет."""
+    global use_wan
+    use_wan = not use_wan
+    return apply_network_mode()
 
 filtrochistki_isOn = True
-periodvkl = 2400
+periodvkl = 1
 timeon = 0.5
 
+# UI-колбэки фильтра (регистрирует create_squares)
+_filter_ui = {"root": None, "on_pulse": None}
 
-def lift(arg_lift, time_on):
-    """Отправляет команду подъёмникам: lift <направление> <секунды>."""
+
+def _notify_filter_pulse(active: bool) -> None:
+    """Обновляет цвет кнопки фильтра при импульсе очистки (из фонового потока)."""
+    root = _filter_ui.get("root")
+    on_pulse = _filter_ui.get("on_pulse")
+    if root is not None and on_pulse is not None:
+        root.after(0, lambda a=active: on_pulse(a))
+
+
+def lift(arg_lift, time_on, *, wait=False, callback=None):
+    """Отправляет команду подъёмникам: lift <направление> <секунды>.
+
+    По умолчанию wait=False — не блокирует очередь других команд.
+    """
     message = f"lift {arg_lift} {time_on}"
     return link_rasb2.send(
         message,
-        wait=True,
+        wait=wait,
         coalesce_key="lift",
+        callback=callback,
     )
 
 
@@ -311,14 +368,27 @@ def run_elevator_new(polozhenie):
 
 
 def Start_filtr_ochistki():
-    global filtrochistki_isOn
+    global filtrochistki_isOn, periodvkl, timeon
 
     while True:
         if filtrochistki_isOn:
-            time.sleep(periodvkl)
+            try:
+                interval = float(periodvkl)
+                pulse = float(timeon)
+            except (TypeError, ValueError):
+                time.sleep(0.5)
+                continue
+
+            time.sleep(interval)
+            if not filtrochistki_isOn:
+                continue
+
+            # импульс очистки: кнопка меняет цвет на время включения
+            _notify_filter_pulse(True)
             link_rasb1.send("filter_relay 0", wait=True, coalesce_key="filter_relay")
-            time.sleep(timeon)
+            time.sleep(pulse)
             link_rasb1.send("filter_relay 1", wait=True, coalesce_key="filter_relay")
+            _notify_filter_pulse(False)
             time.sleep(1)
         else:
             time.sleep(0.5)
@@ -461,7 +531,7 @@ def create_squares():
     total_width = (square_size * 2) + spacing + 250
 
     # Высота: квадраты + отступ + кружки с подписями + доп. информация
-    top_offset = 350
+    top_offset = 400
     total_height = (num_squares * square_size) + top_offset + 50
 
     # Позиционируем окно
@@ -543,6 +613,7 @@ def create_squares():
 
     # Создаём информационную панель напряжения сети
     voltage_y = start_y + 5 * circle_spacing + 10
+    network_mode_y = voltage_y + circle_spacing
 
     # Кружок для напряжения сети
     network_voltage_circle = canvas.create_oval(
@@ -565,6 +636,18 @@ def create_squares():
         font=("Arial", 8, "italic"), anchor="w"
     )
 
+    # Тумблер локаль ↔ интернет (клавиша I; P занята помпой)
+    network_mode_circle = canvas.create_oval(
+        circle_x - circle_size // 2, network_mode_y - circle_size // 2,
+        circle_x + circle_size // 2, network_mode_y + circle_size // 2,
+        fill="cyan", outline="white", width=2
+    )
+    network_mode_text = canvas.create_text(
+        text_x, network_mode_y,
+        text="Сеть: ЛОКАЛЬ (I)", fill="white",
+        font=("Arial", 10, "bold"), anchor="w"
+    )
+
     # Рассчитываем центр для блоков квадратов
     blocks_width = (square_size * 2) + spacing
     blocks_start_x = (total_width - blocks_width) // 2
@@ -572,7 +655,7 @@ def create_squares():
     if blocks_start_x < text_x + 20:
         blocks_start_x = text_x + 20
 
-    block_start_y = voltage_y + 40
+    block_start_y = network_mode_y + 40
 
     # Создаём левый блок
     left_block_x = blocks_start_x
@@ -606,6 +689,21 @@ def create_squares():
                                             fill="gray", outline="white", width=2)
         right_shapes.append(shape)
 
+    def update_network_mode_display():
+        """Обновляет индикатор режима сети (локаль / интернет)."""
+        if use_wan:
+            canvas.itemconfig(network_mode_circle, fill="orange")
+            canvas.itemconfig(
+                network_mode_text,
+                text=f"Сеть: ИНТЕРНЕТ (I) {WAN_HOST}",
+            )
+        else:
+            canvas.itemconfig(network_mode_circle, fill="cyan")
+            canvas.itemconfig(
+                network_mode_text,
+                text="Сеть: ЛОКАЛЬ (I) 192.168.8.x",
+            )
+
     def update_network_voltage_display():
         """Обновляет отображение напряжения сети и цвет кружка"""
         network_voltage = round(call_arduino(), 3)
@@ -627,16 +725,27 @@ def create_squares():
 
         canvas.itemconfig(filter_text_id, text=new_text)
 
+    def on_filter_pulse(active: bool):
+        """Цвет кнопки: жёлтый во время импульса очистки, иначе по filter_level."""
+        nonlocal filter_level
+        if active:
+            canvas.itemconfig(circles[4], fill="yellow")
+            print("Фильтр: импульс очистки ВКЛ (жёлтый)")
+        else:
+            update_circle(4, filter_level, "2state")
+            print(f"Фильтр: импульс очистки ВЫКЛ → {['красный', 'зелёный'][filter_level]}")
+
+    _filter_ui["root"] = root
+    _filter_ui["on_pulse"] = on_filter_pulse
+
     def update_circle(index, level, elem_type):
         """Обновляет цвет кружка по индексу"""
         if elem_type == "4state":
-            # 4 состояния: 0-серый, 1-зелёный, 2-серый, 3-красный
-            if level == 1 or level == 3:
-                color = "gray"
-            elif level == 0:
+            # элеватор: 1/3 включён (вперёд/назад) — зелёный; 0/2 стоп — серый
+            if level in (1, 3):
                 color = "green"
-            elif level == 2:
-                color = "red"
+            else:
+                color = "gray"
         else:  # 2state
             if level == 0:
                 color = "red"
@@ -651,7 +760,12 @@ def create_squares():
         update_circle(3, pump_level, "2state")
         update_circle(4, filter_level, "2state")
 
-        elevator_status = ['зелёный', 'серый', 'красный', 'серый'][elevator_level]
+        elevator_status = {
+            0: "стоп (серый)",
+            1: "вперёд (зелёный)",
+            2: "стоп (серый)",
+            3: "назад (зелёный)",
+        }[elevator_level]
         mustache_status = ['красный', 'зелёный'][mustache_level]
         lift_status = ['красный', 'зелёный'][lift_level]
         pump_status = ['красный', 'зелёный'][pump_level]
@@ -731,38 +845,43 @@ def create_squares():
 
     def show_filter_dialog():
         """Показывает диалог для ввода параметров фильтра в отдельном потоке"""
-        global dialog_active
+        global dialog_active, periodvkl, timeon
 
         def ask_parameters():
             nonlocal filter_level, filter_interval, filter_period
+            global periodvkl, timeon
             try:
                 temp_root = tk.Tk()
                 temp_root.withdraw()
                 temp_root.attributes('-topmost', True)
                 temp_root.lift()
 
-                periodvkl = simpledialog.askstring(
+                period_str = simpledialog.askstring(
                     "Интервал включения",
-                    "Введите интервал включения:",
+                    "Введите интервал включения (сек):",
                     parent=temp_root
                 )
 
-                timeon = simpledialog.askstring(
+                timeon_str = simpledialog.askstring(
                     "Время включения",
-                    "Введите время включения:",
+                    "Введите время включения (сек):",
                     parent=temp_root
                 )
 
                 temp_root.destroy()
 
-                if periodvkl and timeon:
-
-                    filter_interval = timeon
-                    filter_period = periodvkl
+                if period_str and timeon_str:
+                    periodvkl = float(period_str)
+                    timeon = float(timeon_str)
+                    filter_interval = timeon_str
+                    filter_period = period_str
                     root.after(0, update_filter_display)
-                    root.after(0, lambda: print(f"Фильтр: интервал={timeon}, период={periodvkl}"))
+                    root.after(0, lambda: print(
+                        f"Фильтр: интервал={periodvkl}с, импульс={timeon}с"
+                    ))
                 else:
-
+                    global filtrochistki_isOn
+                    filtrochistki_isOn = False
                     filter_level = 0
                     root.after(0, lambda: update_circle(4, filter_level, "2state"))
                     root.after(0, lambda: print("Ввод параметров отменён"))
@@ -906,60 +1025,51 @@ def create_squares():
     def on_lift_key_down():
         nonlocal lift_level, lift_last_ok, lift_busy
 
-        if lift_busy:
-            print("Подъёмники: ждём ответ сервера...")
-            return
         if lift_last_ok == "down":
             print("Подъёмники вниз уже выполнены — сначала нажмите U (вверх)")
             return
 
-        def worker():
-            nonlocal lift_level, lift_last_ok, lift_busy
-            lift_busy = True
-            try:
-                print("-1")
-                time_on = "4"
-                ok = lift("-1", time_on)
-                if ok:
-                    lift_level = 0
-                    lift_last_ok = "down"
-                    root.after(0, lambda: update_circle(2, 0, "2state"))
-                    print(f"Подъёмники: {['красный', 'зелёный'][lift_level]}")
-                else:
-                    print("Подъёмники вниз: сервер не подтвердил команду")
-            finally:
-                lift_busy = False
+        print("-1")
+        time_on = "4"
+        # сразу разрешаем другой ввод; ACK придёт в фоне
+        lift_level = 0
+        lift_last_ok = "down"
+        update_circle(2, 0, "2state")
+        print(f"Подъёмники: {['красный', 'зелёный'][lift_level]}")
 
-        Thread(target=worker, daemon=True).start()
+        def on_done(ok, _resp):
+            nonlocal lift_level, lift_last_ok, lift_busy
+            lift_busy = False
+            if not ok:
+                lift_last_ok = None
+                print("Подъёмники вниз: сервер не подтвердил команду")
+
+        lift_busy = True
+        lift("-1", time_on, wait=False, callback=on_done)
 
     def on_lift_key():
         nonlocal lift_level, lift_last_ok, lift_busy
 
-        if lift_busy:
-            print("Подъёмники: ждём ответ сервера...")
-            return
         if lift_last_ok == "up":
             print("Подъёмники вверх уже выполнены — сначала нажмите J (вниз)")
             return
 
-        def worker():
-            nonlocal lift_level, lift_last_ok, lift_busy
-            lift_busy = True
-            try:
-                print("1")
-                time_on = "4"
-                ok = lift("1",time_on)
-                if ok:
-                    lift_level = 1
-                    lift_last_ok = "up"
-                    root.after(0, lambda: update_circle(2, 1, "2state"))
-                    print(f"Подъёмники: {['красный', 'зелёный'][lift_level]}")
-                else:
-                    print("Подъёмники вверх: сервер не подтвердил команду")
-            finally:
-                lift_busy = False
+        print("1")
+        time_on = "4"
+        lift_level = 1
+        lift_last_ok = "up"
+        update_circle(2, 1, "2state")
+        print(f"Подъёмники: {['красный', 'зелёный'][lift_level]}")
 
-        Thread(target=worker, daemon=True).start()
+        def on_done(ok, _resp):
+            nonlocal lift_level, lift_last_ok, lift_busy
+            lift_busy = False
+            if not ok:
+                lift_last_ok = None
+                print("Подъёмники вверх: сервер не подтвердил команду")
+
+        lift_busy = True
+        lift("1", time_on, wait=False, callback=on_done)
 
     def on_pump_key():
         nonlocal pump_level
@@ -1002,6 +1112,11 @@ def create_squares():
     def on_network_voltage_key():
         update_network_voltage_display()
 
+    def on_network_mode_key():
+        mode, ep1, ep2 = toggle_network_mode()
+        update_network_mode_display()
+        print(f"Переключено: {mode} | {ep1[0]}:{ep1[1]} / {ep2[0]}:{ep2[1]}")
+
     def on_esc():
         root.destroy()
 
@@ -1023,6 +1138,7 @@ def create_squares():
     keyboard.add_hotkey("p", on_pump_key)
     keyboard.add_hotkey("f", on_filter_key)
     keyboard.add_hotkey("n", on_network_voltage_key)
+    keyboard.add_hotkey("i", on_network_mode_key)
     keyboard.add_hotkey("esc", on_esc)
 
     print("Программа запущена!")
@@ -1048,12 +1164,14 @@ def create_squares():
     print('    - Красный → Зелёный: запрос параметров')
     print('    - Зелёный → Красный: сброс параметров')
     print('🟡 "N" - обновить отображение НАПРЯЖЕНИЯ СЕТИ')
+    print('🌐 "I" - тумблер СЕТИ: локаль (192.168.8.x) ↔ интернет (37.9.243.135)')
     print('"ESC" - выход')
     print("=" * 70)
     print(f"НАПРЯЖЕНИЕ СЕТИ: {network_voltage} В (критическое: 21 В)")
     print("=" * 70)
 
     # Начальное обновление
+    update_network_mode_display()
     update_network_voltage_display()
     update_all_circles()
     update_squares()
@@ -1062,8 +1180,8 @@ def create_squares():
 
 if __name__ == "__main__":
     print("Надёжный канал: очередь + retry + keepalive + cmd_id")
-    print(f"  rasb1 {hostname_local_rasb_1}:{port}")
-    print(f"  rasb2 {hostname_local_rasb_2}:{port2}")
+    mode, ep1, ep2 = apply_network_mode()
+    print(f"Старт: {mode} | rasb1 {ep1[0]}:{ep1[1]} | rasb2 {ep2[0]}:{ep2[1]}")
 
     Thread(target=Wake_On_Lan, daemon=True).start()
     Thread(target=create_squares, daemon=True).start()

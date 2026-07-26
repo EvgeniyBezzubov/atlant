@@ -17,7 +17,8 @@ from typing import Optional
 import RPi.GPIO as GPIO
 
 # --- сеть ---
-HOST = "192.168.0.168"
+HOST = "0.0.0.0"  # все интерфейсы: LAN + проброс портов с роутера
+# HOST = "192.168.8.17"
 PORT = 12346
 IDLE_CONN_TIMEOUT = 90.0  # закрыть клиента, если молчит дольше (ONLINE держит живым)
 INACTIVITY_SEC = 5.0  # без команд → пины в HIGH
@@ -152,28 +153,38 @@ def elevator(arg: int) -> None:
 
 
 def lift(pos: int, duration_sec: float) -> None:
-    """Импульс: LOW на duration_sec, затем всегда оба пина HIGH."""
+    """Импульс: направление на duration_sec, затем оба пина HIGH.
+
+    sleep вне gpio_lock, чтобы элеватор/другие команды не ждали весь импульс.
+    """
     if duration_sec <= 0:
         raise ValueError(f"lift: время должно быть > 0, получено {duration_sec}")
 
     with gpio_lock:
-        try:
-            if pos == 1:
-                GPIO.output(PIN_5, GPIO.LOW)
-                GPIO.output(PIN_6, GPIO.HIGH)
-            elif pos == -1:
-                GPIO.output(PIN_5, GPIO.HIGH)
-                GPIO.output(PIN_6, GPIO.LOW)
-            else:
-                raise ValueError(f"lift: неизвестное положение {pos}")
+        if pos == 1:
+            GPIO.output(PIN_5, GPIO.LOW)
+            GPIO.output(PIN_6, GPIO.HIGH)
+        elif pos == -1:
+            GPIO.output(PIN_5, GPIO.HIGH)
+            GPIO.output(PIN_6, GPIO.LOW)
+        else:
+            raise ValueError(f"lift: неизвестное положение {pos}")
 
-            time.sleep(duration_sec)
-        finally:
-            # даже при ошибке/прерывании пины гасим
+    try:
+        time.sleep(duration_sec)
+    finally:
+        with gpio_lock:
             GPIO.output(PIN_5, GPIO.HIGH)
             GPIO.output(PIN_6, GPIO.HIGH)
 
     print(f"lift -> {pos} for {duration_sec}s (pins HIGH)")
+
+
+def lift_async(pos: int, duration_sec: float) -> None:
+    """Запуск импульса в фоне — ACK клиенту уходит сразу."""
+    threading.Thread(
+        target=lift, args=(pos, duration_sec), daemon=True, name="lift-pulse"
+    ).start()
 
 
 def dispatch(payload: str) -> None:
@@ -194,7 +205,8 @@ def dispatch(payload: str) -> None:
     if cmd == "lift":
         if len(parts) < 3:
             raise ValueError("lift: нужны направление и время, пример: lift 1 1")
-        lift(int(parts[1]), float(parts[2]))
+        # не блокируем TCP на время импульса
+        lift_async(int(parts[1]), float(parts[2]))
         return
 
     raise ValueError(f"неизвестная команда: {payload!r}")
