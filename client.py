@@ -269,8 +269,8 @@ class ReliableLink:
 # --- сеть: локальная LAN и внешний IP роутера (проброс портов) ---
 WAN_HOST = "37.9.243.135"
 # Локальные адреса Pi (как в port forwarding на роутере)
-LOCAL_RASB1_HOST = "192.168.8.17"
-LOCAL_RASB2_HOST = "192.168.8.6"
+LOCAL_RASB1_HOST = "192.168.8.21"
+LOCAL_RASB2_HOST = "192.168.8.20"
 PORT_RASB1 = 12345
 PORT_RASB2 = 12346
 
@@ -701,7 +701,7 @@ def create_squares():
             canvas.itemconfig(network_mode_circle, fill="cyan")
             canvas.itemconfig(
                 network_mode_text,
-                text="Сеть: ЛОКАЛЬ (I) 192.168.8.x",
+                text="Сеть: ЛОКАЛЬ (I) .21 / .20",
             )
 
     def update_network_voltage_display():
@@ -1164,7 +1164,7 @@ def create_squares():
     print('    - Красный → Зелёный: запрос параметров')
     print('    - Зелёный → Красный: сброс параметров')
     print('🟡 "N" - обновить отображение НАПРЯЖЕНИЯ СЕТИ')
-    print('🌐 "I" - тумблер СЕТИ: локаль (192.168.8.x) ↔ интернет (37.9.243.135)')
+    print('🌐 "I" - тумблер СЕТИ: локаль (192.168.8.21 / .20) ↔ интернет (37.9.243.135)')
     print('"ESC" - выход')
     print("=" * 70)
     print(f"НАПРЯЖЕНИЕ СЕТИ: {network_voltage} В (критическое: 21 В)")
