@@ -4,6 +4,9 @@ import socket
 import threading
 import time
 import uuid
+import queue
+from dataclasses import dataclass, field
+from typing import Callable, Optional
 
 from kivy.config import Config
 
@@ -20,8 +23,11 @@ from kivy.graphics import Color, Ellipse, Line, RoundedRectangle
 from kivy.metrics import dp
 from kivy.properties import BooleanProperty, ListProperty, NumericProperty, StringProperty
 from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.button import Button
 from kivy.uix.gridlayout import GridLayout
 from kivy.uix.label import Label
+from kivy.uix.popup import Popup
+from kivy.uix.textinput import TextInput
 from kivy.uix.widget import Widget
 
 # --- сеть: локаль и интернет (проброс портов на роутере) ---
@@ -31,20 +37,35 @@ LOCAL_RASB2_HOST = "192.168.8.20"
 RASB1_PORT = 12345
 RASB2_PORT = 12346
 
-# стартовые (локальный режим)
-RASB1_HOST = LOCAL_RASB1_HOST
-RASB2_HOST = LOCAL_RASB2_HOST
+# стартовые (интернет по умолчанию)
+RASB1_HOST = WAN_HOST
+RASB2_HOST = WAN_HOST
 
 COMMAND_TIMEOUT = 5.0
 COMMAND_RETRIES = 3
 KEEPALIVE_INTERVAL = 1.0
+BASE_BACKOFF = 0.25
+MAX_BACKOFF = 2.0
 LIFT_PULSE_SEC = "4"
+# фильтр: как periodvkl / timeon в client.py (меняются диалогом)
 FILTER_INTERVAL_SEC = 1.0
 FILTER_PULSE_SEC = 0.5
 
 
+@dataclass
+class _Job:
+    payload: str
+    cmd_id: str
+    timeout: float
+    retries: int
+    coalesce_key: Optional[str]
+    done: threading.Event = field(default_factory=threading.Event)
+    success: bool = False
+    callback: Optional[Callable[[bool, str], None]] = None
+
+
 class MotorLink:
-    """Постоянное TCP-соединение с подтверждением (как ReliableLink в client.py)."""
+    """Очередь + coalesce, как ReliableLink в client.py (без deadlock)."""
 
     def __init__(self, host, port, name="link"):
         self.host = host
@@ -52,34 +73,138 @@ class MotorLink:
         self.name = name
         self._socket = None
         self._buffer = b""
-        self._lock = threading.Lock()
+        self._io_lock = threading.RLock()
+        self._q: queue.Queue = queue.Queue()
+        self._coalesce = {}
+        self._coalesce_lock = threading.Lock()
+        self._closed = False
         self._last_error = ""
+        self._worker = threading.Thread(
+            target=self._worker_loop, name=f"MotorLink-{name}", daemon=True
+        )
+        self._worker.start()
 
-    def send(self, payload, *, require_cmd_id=True):
-        body = payload.strip()
-        command_id = uuid.uuid4().hex[:12]
-        if body.upper() == "ONLINE":
-            wire = b"ONLINE\n"
-            require_cmd_id = False
-        else:
-            wire = f"{body} id={command_id}\n".encode()
-
-        with self._lock:
-            for attempt in range(COMMAND_RETRIES):
-                try:
-                    sock = self._connect()
-                    sock.sendall(wire)
-                    reply = self._receive_line(sock)
-                    if self._is_ack(reply, command_id, require_cmd_id):
-                        self._last_error = ""
-                        return True
-                    raise OSError(f"неожиданный ответ: {reply!r}")
-                except Exception as exc:
-                    self._last_error = str(exc)
-                    self._disconnect()
-                    if attempt + 1 < COMMAND_RETRIES:
-                        time.sleep(0.25 * (2**attempt))
+    def send(
+        self,
+        payload,
+        *,
+        wait=False,
+        timeout=None,
+        retries=None,
+        coalesce_key=None,
+        require_cmd_id=True,
+        callback=None,
+    ):
+        if self._closed:
             return False
+
+        body = payload.strip()
+        is_online = body.upper() == "ONLINE"
+        job = _Job(
+            payload=body,
+            cmd_id=uuid.uuid4().hex[:12],
+            timeout=COMMAND_TIMEOUT if timeout is None else timeout,
+            retries=COMMAND_RETRIES if retries is None else retries,
+            coalesce_key=coalesce_key,
+            callback=callback,
+        )
+        # ONLINE без id
+        if is_online:
+            require_cmd_id = False
+
+        wait_event = None
+        wait_job = None
+        enqueue = True
+
+        if coalesce_key:
+            with self._coalesce_lock:
+                old = self._coalesce.get(coalesce_key)
+                if old is not None and not old.done.is_set():
+                    old.payload = job.payload
+                    old.cmd_id = job.cmd_id
+                    old.timeout = job.timeout
+                    old.retries = job.retries
+                    old.callback = callback or old.callback
+                    enqueue = False
+                    if wait:
+                        wait_event = old.done
+                        wait_job = old
+                else:
+                    self._coalesce[coalesce_key] = job
+                    if wait:
+                        wait_event = job.done
+                        wait_job = job
+        elif wait:
+            wait_event = job.done
+            wait_job = job
+
+        # помечаем ONLINE на job через cmd_id пустой? храним в payload достаточно
+        job._require_cmd_id = require_cmd_id  # type: ignore[attr-defined]
+
+        if enqueue:
+            self._q.put(job)
+
+        # ждать только ВНЕ coalesce_lock
+        if wait_event is not None and wait_job is not None:
+            wait_event.wait()
+            return wait_job.success
+        return True
+
+    def _worker_loop(self):
+        while not self._closed:
+            job = self._q.get()
+            if job is None:
+                break
+            try:
+                self._execute_job(job)
+            finally:
+                if job.coalesce_key:
+                    with self._coalesce_lock:
+                        if self._coalesce.get(job.coalesce_key) is job:
+                            self._coalesce.pop(job.coalesce_key, None)
+                job.done.set()
+                if job.callback:
+                    try:
+                        job.callback(job.success, "")
+                    except Exception:
+                        pass
+
+    def _execute_job(self, job: _Job):
+        delay = BASE_BACKOFF
+        require_cmd_id = getattr(job, "_require_cmd_id", True)
+        last_err = ""
+        for attempt in range(1, job.retries + 1):
+            ok, err = self._attempt(job.payload, job.cmd_id, job.timeout, require_cmd_id)
+            if ok:
+                job.success = True
+                self._last_error = ""
+                return
+            last_err = err
+            self._last_error = err
+            with self._io_lock:
+                self._disconnect()
+            if attempt < job.retries:
+                time.sleep(delay)
+                delay = min(delay * 2, MAX_BACKOFF)
+        job.success = False
+
+    def _attempt(self, payload, command_id, timeout, require_cmd_id):
+        with self._io_lock:
+            try:
+                sock = self._connect(timeout)
+                if payload.upper() == "ONLINE":
+                    wire = b"ONLINE\n"
+                else:
+                    wire = f"{payload} id={command_id}\n".encode()
+                sock.settimeout(timeout)
+                sock.sendall(wire)
+                reply = self._receive_line(sock)
+                if self._is_ack(reply, command_id, require_cmd_id):
+                    return True, ""
+                return False, f"неожиданный ответ: {reply!r}"
+            except Exception as exc:
+                self._disconnect()
+                return False, str(exc)
 
     @staticmethod
     def _is_ack(text, command_id, require_cmd_id):
@@ -95,12 +220,11 @@ class MotorLink:
             return True
         return True
 
-    def _connect(self):
+    def _connect(self, timeout=None):
         if self._socket is None:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(COMMAND_TIMEOUT)
+            sock.settimeout(timeout if timeout is not None else COMMAND_TIMEOUT)
             sock.connect((self.host, self.port))
-            # На Android часть setsockopt может давать EPERM — не валим соединение
             for args in (
                 (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
                 (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),
@@ -131,12 +255,14 @@ class MotorLink:
         self._buffer = b""
 
     def close(self):
-        with self._lock:
+        self._closed = True
+        self._q.put(None)
+        with self._io_lock:
             self._disconnect()
 
     def set_endpoint(self, host, port):
         """Смена хоста/порта с разрывом текущего сокета."""
-        with self._lock:
+        with self._io_lock:
             self.host = host
             self.port = port
             self._disconnect()
@@ -200,46 +326,54 @@ class MotorController:
                         self._dirty.add(side)
 
             if time.monotonic() >= next_keepalive:
-                ok1 = self.link.send("ONLINE")
-                ok2 = self.link_rasb2.send("ONLINE")
-                if not ok1 or not ok2:
-                    parts = []
-                    if not ok1:
-                        parts.append(
-                            f"rasb1 {self.link.host}:{self.link.port}: "
-                            f"{self.link._last_error or '?'}"
-                        )
-                    if not ok2:
-                        parts.append(
-                            f"rasb2 {self.link_rasb2.host}:{self.link_rasb2.port}: "
-                            f"{self.link_rasb2._last_error or '?'}"
-                        )
-                    self.status_callback("Нет связи: " + "; ".join(parts))
+                ok1 = self.link.send(
+                    "ONLINE", wait=False, coalesce_key=f"{self.link.name}:keepalive"
+                )
+                ok2 = self.link_rasb2.send(
+                    "ONLINE", wait=False, coalesce_key=f"{self.link_rasb2.name}:keepalive"
+                )
+                # статус по keepalive не спамим при wait=False — ошибка видна на командах
                 next_keepalive = time.monotonic() + KEEPALIVE_INTERVAL
 
     def _apply_level(self, side, previous, target):
+        # wait=False + coalesce — как в client.py: быстрые свайпы через WAN не блокируют канал
         gear_command = f"gear_{side}"
         reverse_command = f"reverse_{side}"
 
         if target == 0:
-            return self.link.send(f"{gear_command} 0")
+            return self.link.send(
+                f"{gear_command} 0",
+                wait=False,
+                coalesce_key=gear_command,
+            )
 
         changed_direction = previous != 0 and (previous > 0) != (target > 0)
-        if changed_direction and not self.link.send(f"{gear_command} 0"):
-            return False
+        if changed_direction:
+            self.link.send(
+                f"{gear_command} 0",
+                wait=False,
+                coalesce_key=gear_command,
+            )
 
         direction = -1 if target > 0 else 1
+        self.link.send(
+            f"{reverse_command} {direction}",
+            wait=False,
+            coalesce_key=reverse_command,
+        )
         return self.link.send(
-            f"{reverse_command} {direction}"
-        ) and self.link.send(f"{gear_command} {abs(target)}")
+            f"{gear_command} {abs(target)}",
+            wait=False,
+            coalesce_key=gear_command,
+        )
 
     def shutdown(self):
         with self._condition:
             self._running = False
             self._condition.notify()
         self._worker.join(timeout=1.0)
-        self.link.send("gear_left 0")
-        self.link.send("gear_right 0")
+        self.link.send("gear_left 0", wait=False, coalesce_key="gear_left")
+        self.link.send("gear_right 0", wait=False, coalesce_key="gear_right")
         self.link.close()
         self.link_rasb2.close()
 
@@ -258,9 +392,12 @@ class AuxController:
         self.pump_on = False
         self.filter_on = False
         self.filter_pulsing = False
+        self.filter_interval = FILTER_INTERVAL_SEC
+        self.filter_pulse = FILTER_PULSE_SEC
+        self._filter_dialog_open = False
         self.lift_last_ok = None
         self.lift_busy = False
-        self.use_wan = False  # False=локаль, True=интернет
+        self.use_wan = True  # False=локаль, True=интернет (по умолчанию)
         self._filter_stop = threading.Event()
         self._filter_thread = None
 
@@ -331,8 +468,8 @@ class AuxController:
         threading.Thread(target=self._probe_after_switch, daemon=True).start()
 
     def _probe_after_switch(self):
-        ok1 = self.link1.send("ONLINE")
-        ok2 = self.link2.send("ONLINE")
+        ok1 = self.link1.send("ONLINE", wait=True, coalesce_key="rasb1:keepalive")
+        ok2 = self.link2.send("ONLINE", wait=True, coalesce_key="rasb2:keepalive")
         if ok1 and ok2:
             mode = "ИНТЕРНЕТ" if self.use_wan else "ЛОКАЛЬ"
             self.status_callback(f"Сеть {mode}: связь OK")
@@ -348,15 +485,15 @@ class AuxController:
         def worker():
             if self.elevator_level == 1:
                 self.elevator_level = 2
-                ok = self.link2.send("elevator 2")
+                ok = self.link2.send("elevator 2", wait=True, coalesce_key="elevator")
                 self.status_callback("Элеватор E: стоп" if ok else "Элеватор E: нет связи")
             elif self.elevator_level == 3:
                 self.elevator_level = 2
-                ok = self.link2.send("elevator 2")
+                ok = self.link2.send("elevator 2", wait=True, coalesce_key="elevator")
                 self.status_callback("Элеватор: стоп после R" if ok else "Элеватор: нет связи")
             else:
                 self.elevator_level = 1
-                ok = self.link2.send("elevator 1")
+                ok = self.link2.send("elevator 1", wait=True, coalesce_key="elevator")
                 self.status_callback("Элеватор E: вперёд" if ok else "Элеватор E: нет связи")
             Clock.schedule_once(lambda *_: self._refresh_all_colors())
 
@@ -366,15 +503,15 @@ class AuxController:
         def worker():
             if self.elevator_level == 3:
                 self.elevator_level = 0
-                ok = self.link2.send("elevator 0")
+                ok = self.link2.send("elevator 0", wait=True, coalesce_key="elevator")
                 self.status_callback("Элеватор R: стоп" if ok else "Элеватор R: нет связи")
             elif self.elevator_level == 1:
                 self.elevator_level = 0
-                ok = self.link2.send("elevator 0")
+                ok = self.link2.send("elevator 0", wait=True, coalesce_key="elevator")
                 self.status_callback("Элеватор: стоп после E" if ok else "Элеватор: нет связи")
             else:
                 self.elevator_level = 3
-                ok = self.link2.send("elevator 3")
+                ok = self.link2.send("elevator 3", wait=True, coalesce_key="elevator")
                 self.status_callback("Элеватор R: назад" if ok else "Элеватор R: нет связи")
             Clock.schedule_once(lambda *_: self._refresh_all_colors())
 
@@ -386,7 +523,7 @@ class AuxController:
         self._refresh_all_colors()
 
         def worker():
-            ok = self.link1.send(f"mustache {level}")
+            ok = self.link1.send(f"mustache {level}", wait=True, coalesce_key="mustache")
             self.status_callback(
                 f"Усы Y: {'вкл' if level else 'выкл'}" if ok else "Усы Y: нет связи"
             )
@@ -398,13 +535,14 @@ class AuxController:
             self.status_callback("Подъёмники вверх уже были — сначала J")
             return
 
-        # UI сразу; сеть в фоне — не блокируем ввод на время импульса
         self.lift_last_ok = "up"
         self._refresh_all_colors()
         self.status_callback("Подъёмники U: вверх…")
 
         def worker():
-            ok = self.link2.send(f"lift 1 {LIFT_PULSE_SEC}")
+            ok = self.link2.send(
+                f"lift 1 {LIFT_PULSE_SEC}", wait=True, coalesce_key="lift"
+            )
             if ok:
                 self.status_callback("Подъёмники U: вверх OK")
             else:
@@ -424,7 +562,9 @@ class AuxController:
         self.status_callback("Подъёмники J: вниз…")
 
         def worker():
-            ok = self.link2.send(f"lift -1 {LIFT_PULSE_SEC}")
+            ok = self.link2.send(
+                f"lift -1 {LIFT_PULSE_SEC}", wait=True, coalesce_key="lift"
+            )
             if ok:
                 self.status_callback("Подъёмники J: вниз OK")
             else:
@@ -440,7 +580,7 @@ class AuxController:
         self._refresh_all_colors()
 
         def worker():
-            ok = self.link1.send(f"pump {level}")
+            ok = self.link1.send(f"pump {level}", wait=True, coalesce_key="pump")
             self.status_callback(
                 f"Помпа P: {'вкл' if level else 'выкл'}" if ok else "Помпа P: нет связи"
             )
@@ -448,6 +588,10 @@ class AuxController:
         threading.Thread(target=worker, daemon=True).start()
 
     def _filter(self):
+        if self._filter_dialog_open:
+            self.status_callback("Диалог фильтра уже открыт")
+            return
+
         if self.filter_on:
             self.filter_on = False
             self.filter_pulsing = False
@@ -456,27 +600,91 @@ class AuxController:
             self.status_callback("Фильтр F: выкл")
             return
 
-        self.filter_on = True
-        self._filter_stop.clear()
-        self._refresh_all_colors()
-        self.status_callback(
-            f"Фильтр F: вкл (интервал {FILTER_INTERVAL_SEC}с, импульс {FILTER_PULSE_SEC}с)"
+        # как на Windows: включение + диалог интервала/импульса
+        self._show_filter_dialog()
+
+    def _show_filter_dialog(self):
+        self._filter_dialog_open = True
+        content = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(12))
+        content.add_widget(
+            Label(text="Интервал включения (сек)", size_hint_y=None, height=dp(28))
         )
-        if self._filter_thread is None or not self._filter_thread.is_alive():
-            self._filter_thread = threading.Thread(target=self._filter_loop, daemon=True)
-            self._filter_thread.start()
+        interval_input = TextInput(
+            text=str(self.filter_interval),
+            multiline=False,
+            input_filter="float",
+            size_hint_y=None,
+            height=dp(40),
+        )
+        content.add_widget(interval_input)
+        content.add_widget(
+            Label(text="Длительность импульса (сек)", size_hint_y=None, height=dp(28))
+        )
+        pulse_input = TextInput(
+            text=str(self.filter_pulse),
+            multiline=False,
+            input_filter="float",
+            size_hint_y=None,
+            height=dp(40),
+        )
+        content.add_widget(pulse_input)
+
+        buttons = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
+        popup = Popup(
+            title="Фильтр тонкой очистки",
+            content=content,
+            size_hint=(0.55, 0.55),
+            auto_dismiss=False,
+        )
+
+        def on_ok(*_):
+            try:
+                interval = float(interval_input.text.replace(",", "."))
+                pulse = float(pulse_input.text.replace(",", "."))
+                if interval <= 0 or pulse <= 0:
+                    raise ValueError("значения должны быть > 0")
+            except Exception as exc:
+                self.status_callback(f"Фильтр: неверные числа ({exc})")
+                return
+            self.filter_interval = interval
+            self.filter_pulse = pulse
+            self.filter_on = True
+            self._filter_stop.clear()
+            self._refresh_all_colors()
+            self.status_callback(
+                f"Фильтр F: вкл (интервал {interval}с, импульс {pulse}с)"
+            )
+            if self._filter_thread is None or not self._filter_thread.is_alive():
+                self._filter_thread = threading.Thread(
+                    target=self._filter_loop, daemon=True
+                )
+                self._filter_thread.start()
+            self._filter_dialog_open = False
+            popup.dismiss()
+
+        def on_cancel(*_):
+            self._filter_dialog_open = False
+            self.status_callback("Фильтр F: отмена")
+            popup.dismiss()
+
+        buttons.add_widget(Button(text="OK", on_press=on_ok))
+        buttons.add_widget(Button(text="Отмена", on_press=on_cancel))
+        content.add_widget(buttons)
+        popup.open()
 
     def _filter_loop(self):
         while self.filter_on and not self._filter_stop.is_set():
-            if self._filter_stop.wait(FILTER_INTERVAL_SEC):
+            interval = float(self.filter_interval)
+            pulse = float(self.filter_pulse)
+            if self._filter_stop.wait(interval):
                 break
             if not self.filter_on:
                 break
             self.filter_pulsing = True
             Clock.schedule_once(lambda *_: self._refresh_all_colors())
-            self.link1.send("filter_relay 0")
-            time.sleep(FILTER_PULSE_SEC)
-            self.link1.send("filter_relay 1")
+            self.link1.send("filter_relay 0", wait=True, coalesce_key="filter_relay")
+            time.sleep(pulse)
+            self.link1.send("filter_relay 1", wait=True, coalesce_key="filter_relay")
             self.filter_pulsing = False
             Clock.schedule_once(lambda *_: self._refresh_all_colors())
             time.sleep(0.2)
@@ -556,6 +764,8 @@ class RoundKeyButton(Widget):
 
 
 class VerticalStick(Widget):
+    """Стик с фиксацией скорости: отпустил палец — уровень остаётся."""
+
     level = NumericProperty(0)
 
     def __init__(self, on_level, **kwargs):
@@ -567,8 +777,16 @@ class VerticalStick(Widget):
             self._track = RoundedRectangle(radius=[dp(28)])
             Color(0.35, 0.38, 0.45, 1)
             self._center = Line(width=dp(1.5))
-            Color(0.10, 0.65, 0.95, 1)
+            self._knob_color = Color(0.10, 0.65, 0.95, 1)
             self._knob = Ellipse()
+        self._level_label = Label(
+            text="0",
+            font_size="18sp",
+            bold=True,
+            color=(0.95, 0.97, 1, 1),
+            size_hint=(None, None),
+        )
+        self.add_widget(self._level_label)
         self.bind(pos=self._redraw, size=self._redraw, level=self._redraw)
 
     def on_touch_down(self, touch):
@@ -589,7 +807,8 @@ class VerticalStick(Widget):
         if touch.grab_current is self:
             touch.ungrab(self)
             self._active_touch = None
-            self._set_level(0)
+            # фиксация: НЕ сбрасываем в 0 — скорость остаётся
+            # нейтраль: подведи к центру и отпусти
             return True
         return super().on_touch_up(touch)
 
@@ -620,10 +839,23 @@ class VerticalStick(Widget):
         center_y = (bottom + top) / 2
         self._center.points = [track_x, center_y, track_x + track_width, center_y]
 
+        # активная скорость — зелёный knоb, нейтраль — синий
+        if self.level == 0:
+            self._knob_color.rgba = (0.10, 0.65, 0.95, 1)
+        else:
+            self._knob_color.rgba = (0.20, 0.85, 0.40, 1)
+
         knob_size = min(dp(72), self.width * 0.5)
         knob_y = center_y + (self.level / 3.0) * ((top - bottom) / 2)
         self._knob.pos = (self.center_x - knob_size / 2, knob_y - knob_size / 2)
         self._knob.size = (knob_size, knob_size)
+
+        self._level_label.text = f"{self.level:+d}" if self.level else "0"
+        self._level_label.size = (knob_size, knob_size)
+        self._level_label.center = (
+            self.center_x,
+            knob_y,
+        )
 
 
 class AuxPad(GridLayout):
@@ -721,14 +953,18 @@ class AtlantMotorApp(App):
         except Exception:
             pass
 
-        self.link1 = MotorLink(RASB1_HOST, RASB1_PORT, name="rasb1")
-        self.link2 = MotorLink(RASB2_HOST, RASB2_PORT, name="rasb2")
+        self.link1 = MotorLink(WAN_HOST, RASB1_PORT, name="rasb1")
+        self.link2 = MotorLink(WAN_HOST, RASB2_PORT, name="rasb2")
         self.aux = AuxController(
             self.link1,
             self.link2,
             status_callback=self._set_status,
             ui_callback=lambda *_: None,
         )
+        # зафиксировать интернет-режим на старте
+        self.aux.use_wan = True
+        self.link1.set_endpoint(WAN_HOST, RASB1_PORT)
+        self.link2.set_endpoint(WAN_HOST, RASB2_PORT)
         self.controller = MotorController(self.link1, self.link2, self._set_status)
         self.panel = MotorPanel(self.controller, self.aux)
         return self.panel
@@ -749,8 +985,8 @@ class AtlantMotorApp(App):
         h1, p1 = self.link1.host, self.link1.port
         h2, p2 = self.link2.host, self.link2.port
         self._set_status(f"Проверка… {h1}:{p1} / {h2}:{p2}")
-        ok1 = self.link1.send("ONLINE")
-        ok2 = self.link2.send("ONLINE")
+        ok1 = self.link1.send("ONLINE", wait=True, coalesce_key="rasb1:keepalive")
+        ok2 = self.link2.send("ONLINE", wait=True, coalesce_key="rasb2:keepalive")
         if ok1 and ok2:
             self._set_status("Связь OK: rasb1 и rasb2")
             return

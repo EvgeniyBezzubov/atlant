@@ -96,26 +96,40 @@ class ReliableLink:
             callback=callback,
         )
 
+        wait_event: Optional[threading.Event] = None
+        wait_job: Optional[_Job] = None
+        enqueue = True
+
         if coalesce_key:
             with self._coalesce_lock:
                 old = self._coalesce.get(coalesce_key)
                 if old is not None and not old.done.is_set():
+                    # сливаем в уже стоящую в очереди/исполняемую задачу
                     old.payload = payload
                     old.cmd_id = job.cmd_id
                     old.timeout = job.timeout
                     old.retries = job.retries
                     old.callback = callback or old.callback
+                    enqueue = False
                     if wait:
-                        old.done.wait()
-                        return old.success
-                    return True
-                self._coalesce[coalesce_key] = job
+                        wait_event = old.done
+                        wait_job = old
+                else:
+                    self._coalesce[coalesce_key] = job
+                    if wait:
+                        wait_event = job.done
+                        wait_job = job
+        elif wait:
+            wait_event = job.done
+            wait_job = job
 
-        self._q.put(job)
+        if enqueue:
+            self._q.put(job)
 
-        if wait:
-            job.done.wait()
-            return job.success
+        # ВАЖНО: ждать только ВНЕ coalesce_lock — иначе deadlock с воркером
+        if wait_event is not None and wait_job is not None:
+            wait_event.wait()
+            return wait_job.success
         return True
 
     def keepalive(self, payload: str = "ONLINE") -> bool:
@@ -281,11 +295,11 @@ hostname_local_rasb_2 = LOCAL_RASB2_HOST
 port = PORT_RASB1
 port2 = PORT_RASB2
 
-use_wan = False  # False = локальная сеть, True = интернет через 37.9.243.135
+use_wan = True  # False = локальная сеть, True = интернет через 37.9.243.135
 
-# rasb1 / rasb2 — постоянное соединение, OK|id / DUP|id
-link_rasb1 = ReliableLink(LOCAL_RASB1_HOST, PORT_RASB1, name="rasb1", one_shot=False)
-link_rasb2 = ReliableLink(LOCAL_RASB2_HOST, PORT_RASB2, name="rasb2", one_shot=False)
+# rasb1 / rasb2 — постоянное соединение, OK|id / DUP|id (старт в режиме интернет)
+link_rasb1 = ReliableLink(WAN_HOST, PORT_RASB1, name="rasb1", one_shot=False)
+link_rasb2 = ReliableLink(WAN_HOST, PORT_RASB2, name="rasb2", one_shot=False)
 
 
 def current_endpoints():
@@ -436,7 +450,7 @@ def wake_UP():
 def set_reverse_left(direction):
     ok = link_rasb1.send(
         f"reverse_left {direction}",
-        wait=True,
+        wait=False,
         coalesce_key="reverse_left",
     )
     if not ok:
@@ -446,7 +460,7 @@ def set_reverse_left(direction):
 def set_reverse_right(direction):
     ok = link_rasb1.send(
         f"reverse_right {direction}",
-        wait=True,
+        wait=False,
         coalesce_key="reverse_right",
     )
     if not ok:
@@ -464,8 +478,17 @@ def set_gear_right(arg):
         gear = level  # 1→1, 2→2, 3→3
         reverse_dir = -1
     print(gear)
-    Thread(target=set_reverse_right, args=(reverse_dir,), daemon=True).start()
-    link_rasb1.send(f"gear_right {gear}", wait=True, coalesce_key="gear_right")
+    # wait=False + coalesce: быстрые нажатия через WAN не блокируют канал
+    link_rasb1.send(
+        f"reverse_right {reverse_dir}",
+        wait=False,
+        coalesce_key="reverse_right",
+    )
+    link_rasb1.send(
+        f"gear_right {gear}",
+        wait=False,
+        coalesce_key="gear_right",
+    )
 
 
 def set_gear_left(arg):
@@ -477,9 +500,17 @@ def set_gear_left(arg):
     else:
         gear = level  # 1→1, 2→2, 3→3
         reverse_dir = -1
-    Thread(target=set_reverse_left, args=(reverse_dir,), daemon=True).start()
     print(gear)
-    link_rasb1.send(f"gear_left {gear}", wait=True, coalesce_key="gear_left")
+    link_rasb1.send(
+        f"reverse_left {reverse_dir}",
+        wait=False,
+        coalesce_key="reverse_left",
+    )
+    link_rasb1.send(
+        f"gear_left {gear}",
+        wait=False,
+        coalesce_key="gear_left",
+    )
 
 
 def create_squares():
@@ -530,9 +561,18 @@ def create_squares():
     # Общая ширина: два блока + промежуток + отступ для текста
     total_width = (square_size * 2) + spacing + 250
 
-    # Высота: квадраты + отступ + кружки с подписями + доп. информация
-    top_offset = 400
-    total_height = (num_squares * square_size) + top_offset + 50
+    # Высота строго по содержимому (кружки + тумблеры + передачи) — место под миникарту сверху
+    # start_y=40, 5 кружков, напряжение, режим сети, блоки 7×40
+    content_bottom = (
+        40
+        + 5 * circle_spacing
+        + 10
+        + circle_spacing
+        + 40
+        + num_squares * square_size
+        + 20
+    )
+    total_height = content_bottom
 
     # Позиционируем окно
     margin_x = 30
@@ -775,7 +815,7 @@ def create_squares():
               f"Подъёмники: {lift_status} | Помпа: {pump_status} | "
               f"Фильтр: {filter_status} [{filter_interval} {filter_period}]")
 
-    def update_squares():
+    def update_squares(send: bool = True):
         # Обновляем левый блок (для 7 квадратов с индексами 0-6, центр на индексе 3)
         for i in range(num_squares):
             color = "gray"
@@ -832,16 +872,16 @@ def create_squares():
 
             canvas.itemconfig(right_shapes[i], fill=color)
 
-        Thread(target=set_gear_right, args=(right_level,), daemon=True).start()
-        Thread(target=set_gear_left, args=(left_level,), daemon=True).start()
+        if send:
+            Thread(target=set_gear_right, args=(right_level,), daemon=True).start()
+            Thread(target=set_gear_left, args=(left_level,), daemon=True).start()
 
-        # Вывод статуса передач
-        left_status = {-3: "3 назад", -2: "2 назад", -1: "1 назад", 0: "нейтраль",
-                       1: "1 вперед", 2: "2 вперед", 3: "3 вперед"}[left_level]
-        right_status = {-3: "3 назад", -2: "2 назад", -1: "1 назад", 0: "нейтраль",
-                        1: "1 вперед", 2: "2 вперед", 3: "3 вперед"}[right_level]
+            left_status = {-3: "3 назад", -2: "2 назад", -1: "1 назад", 0: "нейтраль",
+                           1: "1 вперед", 2: "2 вперед", 3: "3 вперед"}[left_level]
+            right_status = {-3: "3 назад", -2: "2 назад", -1: "1 назад", 0: "нейтраль",
+                            1: "1 вперед", 2: "2 вперед", 3: "3 вперед"}[right_level]
 
-        print(f"Левый блок: {left_status} | Правый блок: {right_status}")
+            print(f"Левый блок: {left_status} | Правый блок: {right_status}")
 
     def show_filter_dialog():
         """Показывает диалог для ввода параметров фильтра в отдельном потоке"""
@@ -892,8 +932,19 @@ def create_squares():
 
         threading.Thread(target=ask_parameters, daemon=True).start()
 
+    def autopilot_blocks_motors() -> bool:
+        mm = getattr(root, "_minimap", None)
+        if mm is None:
+            return False
+        try:
+            return bool(mm.autopilot.is_running)
+        except Exception:
+            return False
+
     def on_up():
         nonlocal left_level, right_level
+        if autopilot_blocks_motors():
+            return
         if left_level < 3:
             left_level += 1
         if right_level < 3:
@@ -902,6 +953,8 @@ def create_squares():
 
     def on_down():
         nonlocal left_level, right_level
+        if autopilot_blocks_motors():
+            return
         if left_level > -3:
             left_level -= 1
         if right_level > -3:
@@ -910,6 +963,8 @@ def create_squares():
 
     def on_left():
         nonlocal left_level, right_level
+        if autopilot_blocks_motors():
+            return
         if right_level < 3:
             right_level += 1
         if left_level > -3:
@@ -918,6 +973,8 @@ def create_squares():
 
     def on_right():
         nonlocal left_level, right_level
+        if autopilot_blocks_motors():
+            return
         if right_level > -3:
             right_level -= 1
         if left_level < 3:
@@ -926,6 +983,8 @@ def create_squares():
 
     def on_space():
         nonlocal left_level, right_level
+        if autopilot_blocks_motors():
+            return
         left_level = 0
         right_level = 0
         update_squares()
@@ -933,6 +992,8 @@ def create_squares():
     def on_left_up():
         """7 — повысить скорость только левой части."""
         nonlocal left_level
+        if autopilot_blocks_motors():
+            return
         if left_level < 3:
             left_level += 1
         update_squares()
@@ -940,6 +1001,8 @@ def create_squares():
     def on_left_down():
         """1 — понизить скорость только левой части."""
         nonlocal left_level
+        if autopilot_blocks_motors():
+            return
         if left_level > -3:
             left_level -= 1
         update_squares()
@@ -947,6 +1010,8 @@ def create_squares():
     def on_right_up():
         """9 — повысить скорость только правой части."""
         nonlocal right_level
+        if autopilot_blocks_motors():
+            return
         if right_level < 3:
             right_level += 1
         update_squares()
@@ -954,6 +1019,8 @@ def create_squares():
     def on_right_down():
         """3 — понизить скорость только правой части."""
         nonlocal right_level
+        if autopilot_blocks_motors():
+            return
         if right_level > -3:
             right_level -= 1
         update_squares()
@@ -1175,6 +1242,29 @@ def create_squares():
     update_network_voltage_display()
     update_all_circles()
     update_squares()
+
+    # Миникарта + автопилот (после update_squares — есть left/right_level)
+    try:
+        from show_map import MiniMapApp
+
+        def sync_motor_ui(left: int, right: int) -> None:
+            nonlocal left_level, right_level
+            left_level = max(-3, min(3, int(left)))
+            right_level = max(-3, min(3, int(right)))
+            root.after(0, lambda: update_squares(send=False))
+
+        root._minimap = MiniMapApp(
+            master=root,
+            place_above=(x_pos, y_pos, total_width, total_height),
+            motor_api={
+                "set_left": set_gear_left,
+                "set_right": set_gear_right,
+                "sync_ui": sync_motor_ui,
+            },
+        )
+    except Exception as e:
+        print(f"Миникарта не запущена: {e}")
+
     root.mainloop()
 
 

@@ -14,9 +14,28 @@ from typing import Optional
 import RPi.GPIO as GPIO
 
 # --- сеть ---
-HOST = "0.0.0.0"  # все интерфейсы: LAN + проброс портов с роутера
-# HOST = "192.168.8.21"
 PORT = 12345
+
+
+def get_local_ip() -> str:
+    """Текущий IP хоста в локальной сети (без hardcode)."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except OSError:
+        pass
+    try:
+        return socket.gethostbyname(socket.gethostname())
+    except OSError:
+        return "0.0.0.0"
+
+
+def resolve_bind_host() -> str:
+    ip = get_local_ip()
+    if ip and ip != "127.0.0.1":
+        return ip
+    return "0.0.0.0"
 IDLE_CONN_TIMEOUT = 90.0  # закрыть клиента, если молчит дольше (ONLINE держит живым)
 INACTIVITY_SEC = 5.0  # без команд → пины в HIGH
 
@@ -414,12 +433,13 @@ def main() -> None:
     monitor = threading.Thread(target=monitor_inactivity, daemon=True)
     monitor.start()
 
+    host = resolve_bind_host()
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     enable_keepalive(server)
-    server.bind((HOST, PORT))
+    server.bind((host, PORT))
     server.listen(8)
-    print(f"server run on {HOST}:{PORT} (persistent)")
+    print(f"server run on {host}:{PORT} (persistent)")
 
     try:
         while True:
