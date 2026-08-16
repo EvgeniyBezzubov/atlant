@@ -1,7 +1,8 @@
 #!/usr/bin/env python
 """
-Сервер Raspberry Pi (StendRasb2): объединение server3 + serverrasb2.
+Сервер Raspberry Pi (StendRasb1): объединение server3 + serverrasb2.
 Передачи, реверс, усы, реле, элеватор, подъёмники.
+При конфликте пинов — свободные линии (GPIO5/6/14/20 и др.).
 Постоянное TCP-соединение, cmd_id, ответы OK|id / DUP|id / ERR|id|msg.
 """
 
@@ -54,23 +55,24 @@ GPIO23 = 23  # relle 5    4.5 KOM
 GPIO24 = 24  # relle 10   revers 1
 GPIO25 = 25  # relle 14   3.3 KOM  1st
 GPIO16 = 16  # relle 9    revers 1
-GPIO21 = 21  # relle 6    5kom 2nd (server3) / элеватор PIN_21 (serverrasb2)
+GPIO21 = 21  # relle 6    5kom 2nd (gear_left)
 GPIO3 = 3    # relle фильтр
 GPIO10 = 10  # relle 10 niz — помпа
 GPIO08 = 8   # relle 12 niz — усы
 GPIO15 = 15  # relle 9 niz — запасной
 
 # --- GPIO — serverrasb2 (элеватор / подъёмники) ---
-PIN_5 = 5    # lift
-PIN_6 = 6    # lift
-PIN_20 = 20  # elevator
-PIN_21 = 21  # elevator (совпадает с GPIO21 gear_left — одна физическая линия на стенде)
+# GPIO5/6/20 свободны на rasb1 (4/5 скорости сняты); GPIO21 занят gear_left.
+PIN_5 = 5    # lift (был на rasb2)
+PIN_6 = 6    # lift (был на rasb2)
+PIN_20 = 20  # elevator вперёд (был на rasb2)
+PIN_21 = 14  # elevator назад — вместо 21 (конфликт с GPIO21); был lower_block
 
 ALL_GPIO_PINS = [
     GPIO10, GPIO08, GPIO15, GPIO4, GPIO17,
     GPIO22, GPIO13, GPIO19, GPIO26, GPIO18,
     GPIO23, GPIO24, GPIO25, GPIO16, GPIO21,
-    GPIO3, PIN_5, PIN_6, PIN_20,
+    GPIO3, PIN_5, PIN_6, PIN_20, PIN_21,
 ]
 
 GPIO.setmode(GPIO.BCM)
@@ -470,7 +472,10 @@ def main() -> None:
     enable_keepalive(server)
     server.bind((host, PORT))
     server.listen(8)
-    print(f"StendRasb2 on {host}:{PORT} (server3 + serverrasb2, persistent)")
+    print(
+        f"StendRasb1 on {host}:{PORT} "
+        f"(server3 + serverrasb2, elevator back=GPIO{PIN_21})"
+    )
 
     try:
         while True:
