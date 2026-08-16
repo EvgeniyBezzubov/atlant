@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 """
-Сервер Raspberry Pi (rasb1 / server3): передачи, реверс, усы, реле.
+Сервер Raspberry Pi (StendRasb2): объединение server3 + serverrasb2.
+Передачи, реверс, усы, реле, элеватор, подъёмники.
 Постоянное TCP-соединение, cmd_id, ответы OK|id / DUP|id / ERR|id|msg.
 """
 
@@ -36,37 +37,40 @@ def resolve_bind_host() -> str:
     if ip and ip != "127.0.0.1":
         return ip
     return "0.0.0.0"
-IDLE_CONN_TIMEOUT = 90.0  # закрыть клиента, если молчит дольше (ONLINE держит живым)
-INACTIVITY_SEC = 5.0  # без команд → пины в HIGH
 
-# --- GPIO pin numbers (BCM) ---
-# 4/5 скорости сняты: не инициализируем GPIO5(2KOM), GPIO27(0.1KOM), GPIO6(2KOM), GPIO12(0.1KOM)
-GPIO4 = 4  ###relle 13   4KOM 1st
-GPIO17 = 17  ###relle 8 	revers2
-GPIO22 = 22  ###relle 3		3.3kom 2nd
-GPIO13 = 13  ###relle 11  5KOM  1st
-GPIO19 = 19  ###relle 7	revers2
-GPIO26 = 26  ###relle 12   4.5 KOM 1st
-GPIO18 = 18  ###relle 4    4 kom 2nd
-GPIO23 = 23  ###relle 5  4.5 KOM
-GPIO24 = 24  ###relle 10 revers 1
-GPIO25 = 25  ###relle 14  3.3 KOM  1st
-GPIO16 = 16  ###relle 9revers 1
-GPIO21 = 21  ###relle 6  5kom 2nd
-GPIO14 = 14  ###relle
-GPIO3 = 3  ###relle
-GPIO2 = 2  ###relle
-GPIO9 = 9  ###relle 3 nizhnie blok
-GPIO11 = 11  ###relle 6 nizhnie blok
-GPIO10 = 10  ### relle 10 niz
-GPIO08 = 8  ###relle 12 niz
-GPIO15 = 15  ###relle 9 niz
+
+IDLE_CONN_TIMEOUT = 90.0
+INACTIVITY_SEC = 5.0
+
+# --- GPIO pin numbers (BCM) — server3 ---
+GPIO4 = 4    # relle 13   4KOM 1st
+GPIO17 = 17  # relle 8    revers2
+GPIO22 = 22  # relle 3    3.3kom 2nd
+GPIO13 = 13  # relle 11   5KOM  1st
+GPIO19 = 19  # relle 7    revers2
+GPIO26 = 26  # relle 12   4.5 KOM 1st
+GPIO18 = 18  # relle 4    4 kom 2nd
+GPIO23 = 23  # relle 5    4.5 KOM
+GPIO24 = 24  # relle 10   revers 1
+GPIO25 = 25  # relle 14   3.3 KOM  1st
+GPIO16 = 16  # relle 9    revers 1
+GPIO21 = 21  # relle 6    5kom 2nd (server3) / элеватор PIN_21 (serverrasb2)
+GPIO3 = 3    # relle фильтр
+GPIO10 = 10  # relle 10 niz — помпа
+GPIO08 = 8   # relle 12 niz — усы
+GPIO15 = 15  # relle 9 niz — запасной
+
+# --- GPIO — serverrasb2 (элеватор / подъёмники) ---
+PIN_5 = 5    # lift
+PIN_6 = 6    # lift
+PIN_20 = 20  # elevator
+PIN_21 = 21  # elevator (совпадает с GPIO21 gear_left — одна физическая линия на стенде)
 
 ALL_GPIO_PINS = [
     GPIO10, GPIO08, GPIO15, GPIO4, GPIO17,
     GPIO22, GPIO13, GPIO19, GPIO26, GPIO18,
-    GPIO23, GPIO24, GPIO25, GPIO16, GPIO21, GPIO14,
-    GPIO3, GPIO2, GPIO9, GPIO11,
+    GPIO23, GPIO24, GPIO25, GPIO16, GPIO21,
+    GPIO3, PIN_5, PIN_6, PIN_20,
 ]
 
 GPIO.setmode(GPIO.BCM)
@@ -156,7 +160,7 @@ def enable_keepalive(sock: socket.socket) -> None:
             pass
 
 
-# ---------- логика устройства ----------
+# ---------- логика устройства (server3) ----------
 
 def update_last_command_time() -> None:
     global last_command_time
@@ -217,10 +221,10 @@ def set_reverse_left(direction: int) -> None:
 def set_gear_right(level: int) -> None:
     """Передача правого двигателя: 0=нейтраль, 1..3=скорость."""
     if level == 0:
-        GPIO.output(GPIO13, GPIO.HIGH)  # 5KOM
-        GPIO.output(GPIO26, GPIO.HIGH)  # 4.5KOM
-        GPIO.output(GPIO4, GPIO.HIGH)   # 4KOM
-        GPIO.output(GPIO25, GPIO.HIGH)  # 3.3KOM
+        GPIO.output(GPIO13, GPIO.HIGH)
+        GPIO.output(GPIO26, GPIO.HIGH)
+        GPIO.output(GPIO4, GPIO.HIGH)
+        GPIO.output(GPIO25, GPIO.HIGH)
     elif level == 1:
         GPIO.output(GPIO13, GPIO.LOW)
         GPIO.output(GPIO26, GPIO.LOW)
@@ -243,10 +247,10 @@ def set_gear_right(level: int) -> None:
 def set_gear_left(level: int) -> None:
     """Передача левого двигателя: 0=нейтраль, 1..3=скорость."""
     if level == 0:
-        GPIO.output(GPIO21, GPIO.HIGH)  # 5KOM
-        GPIO.output(GPIO23, GPIO.HIGH)  # 4.5KOM
-        GPIO.output(GPIO18, GPIO.HIGH)  # 4KOM
-        GPIO.output(GPIO22, GPIO.HIGH)  # 3.3KOM
+        GPIO.output(GPIO21, GPIO.HIGH)
+        GPIO.output(GPIO23, GPIO.HIGH)
+        GPIO.output(GPIO18, GPIO.HIGH)
+        GPIO.output(GPIO22, GPIO.HIGH)
     elif level == 1:
         GPIO.output(GPIO21, GPIO.LOW)
         GPIO.output(GPIO23, GPIO.LOW)
@@ -274,35 +278,56 @@ def set_filter_relay(state: int) -> None:
         GPIO.output(GPIO3, GPIO.LOW)
 
 
-def set_lower_block(mode: int) -> None:
-    """Нижний блок реле. mode: 0..4."""
-    if mode == 1:
-        GPIO.output(GPIO2, GPIO.LOW)
-        GPIO.output(GPIO9, GPIO.LOW)
-        GPIO.output(GPIO11, GPIO.HIGH)
-        GPIO.output(GPIO14, GPIO.HIGH)
-    elif mode == 0:
-        GPIO.output(GPIO2, GPIO.HIGH)
-        GPIO.output(GPIO9, GPIO.HIGH)
-        GPIO.output(GPIO11, GPIO.HIGH)
-        GPIO.output(GPIO14, GPIO.HIGH)
-    elif mode == 2:
-        GPIO.output(GPIO2, GPIO.HIGH)
-        GPIO.output(GPIO9, GPIO.LOW)
-        GPIO.output(GPIO11, GPIO.LOW)
-        GPIO.output(GPIO14, GPIO.HIGH)
-    elif mode == 3:
-        GPIO.output(GPIO2, GPIO.LOW)
-        GPIO.output(GPIO9, GPIO.LOW)
-        GPIO.output(GPIO11, GPIO.HIGH)
-        GPIO.output(GPIO14, GPIO.LOW)
-    elif mode == 4:
-        GPIO.output(GPIO2, GPIO.HIGH)
-        GPIO.output(GPIO9, GPIO.LOW)
-        GPIO.output(GPIO11, GPIO.LOW)
-        GPIO.output(GPIO14, GPIO.LOW)
-    else:
-        raise ValueError(f"lower_block: неизвестный режим {mode}")
+# ---------- логика устройства (serverrasb2) ----------
+
+def elevator(arg: int) -> None:
+    with gpio_lock:
+        if arg == 0:
+            GPIO.output(PIN_20, GPIO.HIGH)
+            GPIO.output(PIN_21, GPIO.HIGH)
+        elif arg == 1:
+            GPIO.output(PIN_20, GPIO.LOW)
+            GPIO.output(PIN_21, GPIO.HIGH)
+        elif arg == 2:
+            GPIO.output(PIN_20, GPIO.HIGH)
+            GPIO.output(PIN_21, GPIO.HIGH)
+        elif arg == 3:
+            GPIO.output(PIN_20, GPIO.HIGH)
+            GPIO.output(PIN_21, GPIO.LOW)
+        else:
+            raise ValueError(f"elevator: неизвестное положение {arg}")
+    print(f"elevator -> {arg}")
+
+
+def lift(pos: int, duration_sec: float) -> None:
+    """Импульс подъёмников: направление на duration_sec, затем оба пина HIGH."""
+    if duration_sec <= 0:
+        raise ValueError(f"lift: время должно быть > 0, получено {duration_sec}")
+
+    with gpio_lock:
+        if pos == 1:
+            GPIO.output(PIN_5, GPIO.LOW)
+            GPIO.output(PIN_6, GPIO.HIGH)
+        elif pos == -1:
+            GPIO.output(PIN_5, GPIO.HIGH)
+            GPIO.output(PIN_6, GPIO.LOW)
+        else:
+            raise ValueError(f"lift: неизвестное положение {pos}")
+
+    try:
+        time.sleep(duration_sec)
+    finally:
+        with gpio_lock:
+            GPIO.output(PIN_5, GPIO.HIGH)
+            GPIO.output(PIN_6, GPIO.HIGH)
+
+    print(f"lift -> {pos} for {duration_sec}s (pins HIGH)")
+
+
+def lift_async(pos: int, duration_sec: float) -> None:
+    threading.Thread(
+        target=lift, args=(pos, duration_sec), daemon=True, name="lift-pulse"
+    ).start()
 
 
 def _require_arg(parts: list[str], cmd: str) -> int:
@@ -318,6 +343,16 @@ def dispatch(payload: str) -> None:
     cmd = parts[0].lower()
 
     if cmd == "online":
+        return
+
+    if cmd == "elevator":
+        elevator(_require_arg(parts, cmd))
+        return
+
+    if cmd == "lift":
+        if len(parts) < 3:
+            raise ValueError("lift: нужны направление и время, пример: lift 1 1")
+        lift_async(int(parts[1]), float(parts[2]))
         return
 
     with gpio_lock:
@@ -336,9 +371,6 @@ def dispatch(payload: str) -> None:
         if cmd == "filter_relay":
             set_filter_relay(_require_arg(parts, cmd))
             return
-        if cmd == "lower_block":
-            set_lower_block(_require_arg(parts, cmd))
-            return
         if cmd == "pump":
             set_pump(_require_arg(parts, cmd))
             return
@@ -349,7 +381,6 @@ def dispatch(payload: str) -> None:
             set_mustache(_require_arg(parts, cmd))
             return
         if cmd == "mustache_a":
-            # совместимость со старым клиентом
             set_mustache(_require_arg(parts, cmd))
             return
 
@@ -439,7 +470,7 @@ def main() -> None:
     enable_keepalive(server)
     server.bind((host, PORT))
     server.listen(8)
-    print(f"server run on {host}:{PORT} (persistent)")
+    print(f"StendRasb2 on {host}:{PORT} (server3 + serverrasb2, persistent)")
 
     try:
         while True:

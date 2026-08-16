@@ -34,12 +34,15 @@ from kivy.uix.widget import Widget
 WAN_HOST = "37.9.243.135"
 LOCAL_RASB1_HOST = "192.168.8.21"
 LOCAL_RASB2_HOST = "192.168.8.20"
+LOCAL_STEND_HOST = "192.168.8.20"
 RASB1_PORT = 12345
 RASB2_PORT = 12346
+PORT_STEND = 12345
 
 # стартовые (интернет по умолчанию)
 RASB1_HOST = WAN_HOST
 RASB2_HOST = WAN_HOST
+use_unified_stend = False  # False = server3+serverrasb2, True = StendRasb2
 
 COMMAND_TIMEOUT = 5.0
 COMMAND_RETRIES = 3
@@ -269,11 +272,12 @@ class MotorLink:
 
 
 class MotorController:
-    """Стики двигателей → rasb1."""
+    """Стики двигателей → rasb1 или StendRasb2."""
 
-    def __init__(self, link_rasb1, link_rasb2, status_callback):
+    def __init__(self, link_rasb1, link_rasb2, link_stend, status_callback):
         self.link = link_rasb1
         self.link_rasb2 = link_rasb2
+        self.link_stend = link_stend
         self.status_callback = status_callback
         self._condition = threading.Condition()
         self._desired = {"left": 0, "right": 0}
@@ -282,6 +286,12 @@ class MotorController:
         self._running = True
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
+
+    def _motor_link(self):
+        return self.link_stend if use_unified_stend else self.link
+
+    def _aux_link(self):
+        return self.link_stend if use_unified_stend else self.link_rasb2
 
     def set_level(self, side, level):
         level = max(-3, min(3, int(level)))
@@ -311,9 +321,10 @@ class MotorController:
                 if ok:
                     with self._condition:
                         self._applied[side] = target
-                err = self.link._last_error
+                motor = self._motor_link()
+                err = motor._last_error
                 detail = (
-                    f" [{self.link.host}:{self.link.port}] {err}"
+                    f" [{motor.host}:{motor.port}] {err}"
                     if (not ok and err)
                     else ""
                 )
@@ -326,22 +337,30 @@ class MotorController:
                         self._dirty.add(side)
 
             if time.monotonic() >= next_keepalive:
-                ok1 = self.link.send(
-                    "ONLINE", wait=False, coalesce_key=f"{self.link.name}:keepalive"
-                )
-                ok2 = self.link_rasb2.send(
-                    "ONLINE", wait=False, coalesce_key=f"{self.link_rasb2.name}:keepalive"
-                )
-                # статус по keepalive не спамим при wait=False — ошибка видна на командах
+                if use_unified_stend:
+                    self.link_stend.send(
+                        "ONLINE",
+                        wait=False,
+                        coalesce_key=f"{self.link_stend.name}:keepalive",
+                    )
+                else:
+                    self.link.send(
+                        "ONLINE", wait=False, coalesce_key=f"{self.link.name}:keepalive"
+                    )
+                    self.link_rasb2.send(
+                        "ONLINE",
+                        wait=False,
+                        coalesce_key=f"{self.link_rasb2.name}:keepalive",
+                    )
                 next_keepalive = time.monotonic() + KEEPALIVE_INTERVAL
 
     def _apply_level(self, side, previous, target):
-        # wait=False + coalesce — как в client.py: быстрые свайпы через WAN не блокируют канал
+        link = self._motor_link()
         gear_command = f"gear_{side}"
         reverse_command = f"reverse_{side}"
 
         if target == 0:
-            return self.link.send(
+            return link.send(
                 f"{gear_command} 0",
                 wait=False,
                 coalesce_key=gear_command,
@@ -349,19 +368,19 @@ class MotorController:
 
         changed_direction = previous != 0 and (previous > 0) != (target > 0)
         if changed_direction:
-            self.link.send(
+            link.send(
                 f"{gear_command} 0",
                 wait=False,
                 coalesce_key=gear_command,
             )
 
         direction = -1 if target > 0 else 1
-        self.link.send(
+        link.send(
             f"{reverse_command} {direction}",
             wait=False,
             coalesce_key=reverse_command,
         )
-        return self.link.send(
+        return link.send(
             f"{gear_command} {abs(target)}",
             wait=False,
             coalesce_key=gear_command,
@@ -372,18 +391,21 @@ class MotorController:
             self._running = False
             self._condition.notify()
         self._worker.join(timeout=1.0)
-        self.link.send("gear_left 0", wait=False, coalesce_key="gear_left")
-        self.link.send("gear_right 0", wait=False, coalesce_key="gear_right")
+        motor = self._motor_link()
+        motor.send("gear_left 0", wait=False, coalesce_key="gear_left")
+        motor.send("gear_right 0", wait=False, coalesce_key="gear_right")
         self.link.close()
         self.link_rasb2.close()
+        self.link_stend.close()
 
 
 class AuxController:
-    """Логика кнопок E/R/Y/U/J/P/F/I как в client.py."""
+    """Логика кнопок E/R/Y/U/J/P/F/I/T как в client.py."""
 
-    def __init__(self, link_rasb1, link_rasb2, status_callback, ui_callback):
+    def __init__(self, link_rasb1, link_rasb2, link_stend, status_callback, ui_callback):
         self.link1 = link_rasb1
         self.link2 = link_rasb2
+        self.link_stend = link_stend
         self.status_callback = status_callback
         self.ui_callback = ui_callback  # key -> color rgba
 
@@ -403,6 +425,12 @@ class AuxController:
 
         self._refresh_all_colors()
 
+    def _motor_link(self):
+        return self.link_stend if use_unified_stend else self.link1
+
+    def _aux_link(self):
+        return self.link_stend if use_unified_stend else self.link2
+
     def press(self, key: str):
         key = key.lower()
         handlers = {
@@ -414,6 +442,7 @@ class AuxController:
             "p": self._pump,
             "f": self._filter,
             "i": self._toggle_network,
+            "t": self._toggle_stend,
         }
         handler = handlers.get(key)
         if handler:
@@ -429,6 +458,8 @@ class AuxController:
         yellow = (0.95, 0.80, 0.15, 1)
         cyan = (0.20, 0.75, 0.85, 1)
         orange = (0.95, 0.55, 0.15, 1)
+        lime = (0.55, 0.90, 0.25, 1)
+        magenta = (0.85, 0.25, 0.75, 1)
 
         if self.elevator_level == 1:
             self._set_color("e", green)
@@ -451,23 +482,58 @@ class AuxController:
         self._set_color("u", green if self.lift_last_ok == "up" else gray)
         self._set_color("j", green if self.lift_last_ok == "down" else gray)
         self._set_color("i", orange if self.use_wan else cyan)
+        self._set_color("t", magenta if use_unified_stend else lime)
+
+    def _toggle_stend(self):
+        global use_unified_stend
+        use_unified_stend = not use_unified_stend
+        self._apply_endpoints()
+        self._refresh_all_colors()
+        stend = "StendRasb2" if use_unified_stend else "2 Pi"
+        self.status_callback(f"Стенд: {stend}")
+        threading.Thread(target=self._probe_after_switch, daemon=True).start()
+
+    def _apply_endpoints(self):
+        if use_unified_stend:
+            host = WAN_HOST if self.use_wan else LOCAL_STEND_HOST
+            self.link_stend.set_endpoint(host, PORT_STEND)
+        else:
+            if self.use_wan:
+                h1, h2 = WAN_HOST, WAN_HOST
+            else:
+                h1, h2 = LOCAL_RASB1_HOST, LOCAL_RASB2_HOST
+            self.link1.set_endpoint(h1, RASB1_PORT)
+            self.link2.set_endpoint(h2, RASB2_PORT)
 
     def _toggle_network(self):
         self.use_wan = not self.use_wan
-        if self.use_wan:
-            h1, h2 = WAN_HOST, WAN_HOST
-        else:
-            h1, h2 = LOCAL_RASB1_HOST, LOCAL_RASB2_HOST
-        self.link1.set_endpoint(h1, RASB1_PORT)
-        self.link2.set_endpoint(h2, RASB2_PORT)
+        self._apply_endpoints()
         self._refresh_all_colors()
         mode = "ИНТЕРНЕТ" if self.use_wan else "ЛОКАЛЬ"
-        self.status_callback(
-            f"Сеть: {mode} | {h1}:{RASB1_PORT} / {h2}:{RASB2_PORT}"
-        )
+        if use_unified_stend:
+            host = WAN_HOST if self.use_wan else LOCAL_STEND_HOST
+            self.status_callback(f"Сеть: {mode} | StendRasb2 {host}:{PORT_STEND}")
+        else:
+            h1 = WAN_HOST if self.use_wan else LOCAL_RASB1_HOST
+            h2 = WAN_HOST if self.use_wan else LOCAL_RASB2_HOST
+            self.status_callback(
+                f"Сеть: {mode} | {h1}:{RASB1_PORT} / {h2}:{RASB2_PORT}"
+            )
         threading.Thread(target=self._probe_after_switch, daemon=True).start()
 
     def _probe_after_switch(self):
+        if use_unified_stend:
+            ok = self.link_stend.send(
+                "ONLINE", wait=True, coalesce_key="stend:keepalive"
+            )
+            if ok:
+                mode = "ИНТЕРНЕТ" if self.use_wan else "ЛОКАЛЬ"
+                self.status_callback(f"StendRasb2 ({mode}): связь OK")
+            else:
+                self.status_callback(
+                    f"StendRasb2 нет связи: {self.link_stend._last_error or '?'}"
+                )
+            return
         ok1 = self.link1.send("ONLINE", wait=True, coalesce_key="rasb1:keepalive")
         ok2 = self.link2.send("ONLINE", wait=True, coalesce_key="rasb2:keepalive")
         if ok1 and ok2:
@@ -483,17 +549,18 @@ class AuxController:
 
     def _elevator_forward(self):
         def worker():
+            link = self._aux_link()
             if self.elevator_level == 1:
                 self.elevator_level = 2
-                ok = self.link2.send("elevator 2", wait=True, coalesce_key="elevator")
+                ok = link.send("elevator 2", wait=True, coalesce_key="elevator")
                 self.status_callback("Элеватор E: стоп" if ok else "Элеватор E: нет связи")
             elif self.elevator_level == 3:
                 self.elevator_level = 2
-                ok = self.link2.send("elevator 2", wait=True, coalesce_key="elevator")
+                ok = link.send("elevator 2", wait=True, coalesce_key="elevator")
                 self.status_callback("Элеватор: стоп после R" if ok else "Элеватор: нет связи")
             else:
                 self.elevator_level = 1
-                ok = self.link2.send("elevator 1", wait=True, coalesce_key="elevator")
+                ok = link.send("elevator 1", wait=True, coalesce_key="elevator")
                 self.status_callback("Элеватор E: вперёд" if ok else "Элеватор E: нет связи")
             Clock.schedule_once(lambda *_: self._refresh_all_colors())
 
@@ -501,17 +568,18 @@ class AuxController:
 
     def _elevator_back(self):
         def worker():
+            link = self._aux_link()
             if self.elevator_level == 3:
                 self.elevator_level = 0
-                ok = self.link2.send("elevator 0", wait=True, coalesce_key="elevator")
+                ok = link.send("elevator 0", wait=True, coalesce_key="elevator")
                 self.status_callback("Элеватор R: стоп" if ok else "Элеватор R: нет связи")
             elif self.elevator_level == 1:
                 self.elevator_level = 0
-                ok = self.link2.send("elevator 0", wait=True, coalesce_key="elevator")
+                ok = link.send("elevator 0", wait=True, coalesce_key="elevator")
                 self.status_callback("Элеватор: стоп после E" if ok else "Элеватор: нет связи")
             else:
                 self.elevator_level = 3
-                ok = self.link2.send("elevator 3", wait=True, coalesce_key="elevator")
+                ok = link.send("elevator 3", wait=True, coalesce_key="elevator")
                 self.status_callback("Элеватор R: назад" if ok else "Элеватор R: нет связи")
             Clock.schedule_once(lambda *_: self._refresh_all_colors())
 
@@ -523,7 +591,9 @@ class AuxController:
         self._refresh_all_colors()
 
         def worker():
-            ok = self.link1.send(f"mustache {level}", wait=True, coalesce_key="mustache")
+            ok = self._motor_link().send(
+                f"mustache {level}", wait=True, coalesce_key="mustache"
+            )
             self.status_callback(
                 f"Усы Y: {'вкл' if level else 'выкл'}" if ok else "Усы Y: нет связи"
             )
@@ -540,7 +610,7 @@ class AuxController:
         self.status_callback("Подъёмники U: вверх…")
 
         def worker():
-            ok = self.link2.send(
+            ok = self._aux_link().send(
                 f"lift 1 {LIFT_PULSE_SEC}", wait=True, coalesce_key="lift"
             )
             if ok:
@@ -562,7 +632,7 @@ class AuxController:
         self.status_callback("Подъёмники J: вниз…")
 
         def worker():
-            ok = self.link2.send(
+            ok = self._aux_link().send(
                 f"lift -1 {LIFT_PULSE_SEC}", wait=True, coalesce_key="lift"
             )
             if ok:
@@ -580,7 +650,9 @@ class AuxController:
         self._refresh_all_colors()
 
         def worker():
-            ok = self.link1.send(f"pump {level}", wait=True, coalesce_key="pump")
+            ok = self._motor_link().send(
+                f"pump {level}", wait=True, coalesce_key="pump"
+            )
             self.status_callback(
                 f"Помпа P: {'вкл' if level else 'выкл'}" if ok else "Помпа P: нет связи"
             )
@@ -682,9 +754,11 @@ class AuxController:
                 break
             self.filter_pulsing = True
             Clock.schedule_once(lambda *_: self._refresh_all_colors())
-            self.link1.send("filter_relay 0", wait=True, coalesce_key="filter_relay")
+            self._motor_link().send("filter_relay 0", wait=True, coalesce_key="filter_relay")
             time.sleep(pulse)
-            self.link1.send("filter_relay 1", wait=True, coalesce_key="filter_relay")
+            self._motor_link().send(
+                "filter_relay 1", wait=True, coalesce_key="filter_relay"
+            )
             self.filter_pulsing = False
             Clock.schedule_once(lambda *_: self._refresh_all_colors())
             time.sleep(0.2)
@@ -862,9 +936,9 @@ class AuxPad(GridLayout):
     """Сетка круглых кнопок между стиками."""
 
     def __init__(self, on_key, **kwargs):
-        super().__init__(cols=2, spacing=dp(10), padding=dp(8), **kwargs)
+        super().__init__(cols=3, spacing=dp(10), padding=dp(8), **kwargs)
         self.buttons = {}
-        for key in ("e", "r", "y", "u", "j", "p", "f", "i"):
+        for key in ("e", "r", "y", "u", "j", "p", "f", "i", "t"):
             btn = RoundKeyButton(key=key, on_press=on_key, size_hint=(1, 1))
             self.buttons[key] = btn
             self.add_widget(btn)
@@ -896,7 +970,7 @@ class MotorPanel(BoxLayout):
         center = BoxLayout(orientation="vertical", size_hint_x=0.44, spacing=dp(4))
         center.add_widget(
             Label(
-                text="[b]E R Y U J P F I[/b]",
+                text="[b]E R Y U J P F I T[/b]",
                 markup=True,
                 size_hint_y=0.08,
                 font_size="14sp",
@@ -955,9 +1029,11 @@ class AtlantMotorApp(App):
 
         self.link1 = MotorLink(WAN_HOST, RASB1_PORT, name="rasb1")
         self.link2 = MotorLink(WAN_HOST, RASB2_PORT, name="rasb2")
+        self.link_stend = MotorLink(WAN_HOST, PORT_STEND, name="stend")
         self.aux = AuxController(
             self.link1,
             self.link2,
+            self.link_stend,
             status_callback=self._set_status,
             ui_callback=lambda *_: None,
         )
@@ -965,7 +1041,10 @@ class AtlantMotorApp(App):
         self.aux.use_wan = True
         self.link1.set_endpoint(WAN_HOST, RASB1_PORT)
         self.link2.set_endpoint(WAN_HOST, RASB2_PORT)
-        self.controller = MotorController(self.link1, self.link2, self._set_status)
+        self.link_stend.set_endpoint(WAN_HOST, PORT_STEND)
+        self.controller = MotorController(
+            self.link1, self.link2, self.link_stend, self._set_status
+        )
         self.panel = MotorPanel(self.controller, self.aux)
         return self.panel
 
@@ -982,6 +1061,17 @@ class AtlantMotorApp(App):
 
     def _probe_servers(self):
         """Сразу показать, до кого доходим (и точную ошибку OS)."""
+        if use_unified_stend:
+            h, p = self.link_stend.host, self.link_stend.port
+            self._set_status(f"Проверка StendRasb2… {h}:{p}")
+            ok = self.link_stend.send("ONLINE", wait=True, coalesce_key="stend:keepalive")
+            if ok:
+                self._set_status("Связь OK: StendRasb2")
+            else:
+                self._set_status(
+                    f"StendRasb2 нет связи: {self.link_stend._last_error or '?'}"
+                )
+            return
         h1, p1 = self.link1.host, self.link1.port
         h2, p2 = self.link2.host, self.link2.port
         self._set_status(f"Проверка… {h1}:{p1} / {h2}:{p2}")

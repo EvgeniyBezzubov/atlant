@@ -53,11 +53,7 @@ GPIO24 = 24  ###relle 10 revers 1
 GPIO25 = 25  ###relle 14  3.3 KOM  1st
 GPIO16 = 16  ###relle 9revers 1
 GPIO21 = 21  ###relle 6  5kom 2nd
-GPIO14 = 14  ###relle
 GPIO3 = 3  ###relle
-GPIO2 = 2  ###relle
-GPIO9 = 9  ###relle 3 nizhnie blok
-GPIO11 = 11  ###relle 6 nizhnie blok
 GPIO10 = 10  ### relle 10 niz
 GPIO08 = 8  ###relle 12 niz
 GPIO15 = 15  ###relle 9 niz
@@ -65,8 +61,8 @@ GPIO15 = 15  ###relle 9 niz
 ALL_GPIO_PINS = [
     GPIO10, GPIO08, GPIO15, GPIO4, GPIO17,
     GPIO22, GPIO13, GPIO19, GPIO26, GPIO18,
-    GPIO23, GPIO24, GPIO25, GPIO16, GPIO21, GPIO14,
-    GPIO3, GPIO2, GPIO9, GPIO11,
+    GPIO23, GPIO24, GPIO25, GPIO16, GPIO21,
+    GPIO3,
 ]
 
 GPIO.setmode(GPIO.BCM)
@@ -274,37 +270,6 @@ def set_filter_relay(state: int) -> None:
         GPIO.output(GPIO3, GPIO.LOW)
 
 
-def set_lower_block(mode: int) -> None:
-    """Нижний блок реле. mode: 0..4."""
-    if mode == 1:
-        GPIO.output(GPIO2, GPIO.LOW)
-        GPIO.output(GPIO9, GPIO.LOW)
-        GPIO.output(GPIO11, GPIO.HIGH)
-        GPIO.output(GPIO14, GPIO.HIGH)
-    elif mode == 0:
-        GPIO.output(GPIO2, GPIO.HIGH)
-        GPIO.output(GPIO9, GPIO.HIGH)
-        GPIO.output(GPIO11, GPIO.HIGH)
-        GPIO.output(GPIO14, GPIO.HIGH)
-    elif mode == 2:
-        GPIO.output(GPIO2, GPIO.HIGH)
-        GPIO.output(GPIO9, GPIO.LOW)
-        GPIO.output(GPIO11, GPIO.LOW)
-        GPIO.output(GPIO14, GPIO.HIGH)
-    elif mode == 3:
-        GPIO.output(GPIO2, GPIO.LOW)
-        GPIO.output(GPIO9, GPIO.LOW)
-        GPIO.output(GPIO11, GPIO.HIGH)
-        GPIO.output(GPIO14, GPIO.LOW)
-    elif mode == 4:
-        GPIO.output(GPIO2, GPIO.HIGH)
-        GPIO.output(GPIO9, GPIO.LOW)
-        GPIO.output(GPIO11, GPIO.LOW)
-        GPIO.output(GPIO14, GPIO.LOW)
-    else:
-        raise ValueError(f"lower_block: неизвестный режим {mode}")
-
-
 def _require_arg(parts: list[str], cmd: str) -> int:
     if len(parts) < 2:
         raise ValueError(f"{cmd}: нет аргумента")
@@ -335,9 +300,6 @@ def dispatch(payload: str) -> None:
             return
         if cmd == "filter_relay":
             set_filter_relay(_require_arg(parts, cmd))
-            return
-        if cmd == "lower_block":
-            set_lower_block(_require_arg(parts, cmd))
             return
         if cmd == "pump":
             set_pump(_require_arg(parts, cmd))

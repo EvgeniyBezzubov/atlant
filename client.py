@@ -283,10 +283,12 @@ class ReliableLink:
 # --- сеть: локальная LAN и внешний IP роутера (проброс портов) ---
 WAN_HOST = "37.9.243.135"
 # Локальные адреса Pi (как в port forwarding на роутере)
-LOCAL_RASB1_HOST = "192.168.8.21"
+LOCAL_RASB1_HOST = "192.168.0.251"
 LOCAL_RASB2_HOST = "192.168.8.20"
+LOCAL_STEND_HOST = "192.168.8.20"  # единый StendRasb2 (server3 + serverrasb2)
 PORT_RASB1 = 12345
 PORT_RASB2 = 12346
+PORT_STEND = 12345
 
 # совместимость со старыми именами
 hostname = WAN_HOST
@@ -296,33 +298,61 @@ port = PORT_RASB1
 port2 = PORT_RASB2
 
 use_wan = True  # False = локальная сеть, True = интернет через 37.9.243.135
+use_unified_stend = False  # False = server3 + serverrasb2, True = StendRasb2
 
-# rasb1 / rasb2 — постоянное соединение, OK|id / DUP|id (старт в режиме интернет)
+# rasb1 / rasb2 / stend — постоянное соединение, OK|id / DUP|id (старт в режиме интернет)
 link_rasb1 = ReliableLink(WAN_HOST, PORT_RASB1, name="rasb1", one_shot=False)
 link_rasb2 = ReliableLink(WAN_HOST, PORT_RASB2, name="rasb2", one_shot=False)
+link_stend = ReliableLink(WAN_HOST, PORT_STEND, name="stend", one_shot=False)
+
+
+def link_motor():
+    """Канал для передач, реверса, помпы, усов, фильтра."""
+    return link_stend if use_unified_stend else link_rasb1
+
+
+def link_elevator():
+    """Канал для элеватора и подъёмников."""
+    return link_stend if use_unified_stend else link_rasb2
 
 
 def current_endpoints():
-    """Текущие (host, port) для rasb1/rasb2."""
+    """Текущие (host, port) для rasb1/rasb2 или StendRasb2."""
+    if use_unified_stend:
+        host = WAN_HOST if use_wan else LOCAL_STEND_HOST
+        return (host, PORT_STEND), (host, PORT_STEND)
     if use_wan:
         return (WAN_HOST, PORT_RASB1), (WAN_HOST, PORT_RASB2)
     return (LOCAL_RASB1_HOST, PORT_RASB1), (LOCAL_RASB2_HOST, PORT_RASB2)
 
 
 def apply_network_mode():
-    """Применить use_wan к обоим каналам."""
+    """Применить use_wan и use_unified_stend к каналам."""
     ep1, ep2 = current_endpoints()
-    link_rasb1.set_endpoint(*ep1)
-    link_rasb2.set_endpoint(*ep2)
-    mode = "ИНТЕРНЕТ" if use_wan else "ЛОКАЛЬ"
-    print(f"Режим сети: {mode} | rasb1 {ep1[0]}:{ep1[1]} | rasb2 {ep2[0]}:{ep2[1]}")
-    return mode, ep1, ep2
+    if use_unified_stend:
+        link_stend.set_endpoint(*ep1)
+    else:
+        link_rasb1.set_endpoint(*ep1)
+        link_rasb2.set_endpoint(*ep2)
+    net = "ИНТЕРНЕТ" if use_wan else "ЛОКАЛЬ"
+    stend = "StendRasb2" if use_unified_stend else "server3+serverrasb2"
+    print(f"Режим: {net} | стенд: {stend} | {ep1[0]}:{ep1[1]}" + (
+        "" if use_unified_stend else f" / {ep2[0]}:{ep2[1]}"
+    ))
+    return net, ep1, ep2
 
 
 def toggle_network_mode():
     """Переключить локаль ↔ интернет."""
     global use_wan
     use_wan = not use_wan
+    return apply_network_mode()
+
+
+def toggle_stend_mode():
+    """Переключить server3+serverrasb2 ↔ StendRasb2."""
+    global use_unified_stend
+    use_unified_stend = not use_unified_stend
     return apply_network_mode()
 
 filtrochistki_isOn = True
@@ -347,7 +377,7 @@ def lift(arg_lift, time_on, *, wait=False, callback=None):
     По умолчанию wait=False — не блокирует очередь других команд.
     """
     message = f"lift {arg_lift} {time_on}"
-    return link_rasb2.send(
+    return link_elevator().send(
         message,
         wait=wait,
         coalesce_key="lift",
@@ -357,14 +387,14 @@ def lift(arg_lift, time_on, *, wait=False, callback=None):
 
 def set_pump(state):
     """Помпа: state 0/1."""
-    ok = link_rasb1.send(f"pump {state}", wait=True, coalesce_key="pump")
+    ok = link_motor().send(f"pump {state}", wait=True, coalesce_key="pump")
     print("pump ACK" if ok else "pump FAIL")
     return ok
 
 
 def set_mustache(state):
     """Усы: state 0/1 (только GPIO8 на rasb1)."""
-    ok = link_rasb1.send(f"mustache {state}", wait=True, coalesce_key="mustache")
+    ok = link_motor().send(f"mustache {state}", wait=True, coalesce_key="mustache")
     print("mustache ACK" if ok else "mustache FAIL")
     return ok
 
@@ -372,7 +402,7 @@ def set_mustache(state):
 def run_elevator_new(polozhenie):
     message = "elevator " + str(polozhenie)
     print(str(polozhenie))
-    ok = link_rasb2.send(
+    ok = link_elevator().send(
         message,
         wait=True,
         coalesce_key="elevator",
@@ -399,9 +429,9 @@ def Start_filtr_ochistki():
 
             # импульс очистки: кнопка меняет цвет на время включения
             _notify_filter_pulse(True)
-            link_rasb1.send("filter_relay 0", wait=True, coalesce_key="filter_relay")
+            link_motor().send("filter_relay 0", wait=True, coalesce_key="filter_relay")
             time.sleep(pulse)
-            link_rasb1.send("filter_relay 1", wait=True, coalesce_key="filter_relay")
+            link_motor().send("filter_relay 1", wait=True, coalesce_key="filter_relay")
             _notify_filter_pulse(False)
             time.sleep(1)
         else:
@@ -429,7 +459,12 @@ def Wake_On_Lan():
 
 
 def wake_UP():
-    """ONLINE на обе Pi параллельно — чтобы таймер бездействия на rasb2 не сбрасывался из‑за задержки rasb1."""
+    """ONLINE — на StendRasb2 одно соединение, иначе на обе Pi параллельно."""
+    if use_unified_stend:
+        if not link_stend.keepalive("ONLINE"):
+            print("StendRasb2 офлайн")
+        return
+
     results = {}
 
     def ping(name, link):
@@ -448,7 +483,7 @@ def wake_UP():
 
 
 def set_reverse_left(direction):
-    ok = link_rasb1.send(
+    ok = link_motor().send(
         f"reverse_left {direction}",
         wait=False,
         coalesce_key="reverse_left",
@@ -458,7 +493,7 @@ def set_reverse_left(direction):
 
 
 def set_reverse_right(direction):
-    ok = link_rasb1.send(
+    ok = link_motor().send(
         f"reverse_right {direction}",
         wait=False,
         coalesce_key="reverse_right",
@@ -479,12 +514,12 @@ def set_gear_right(arg):
         reverse_dir = -1
     print(gear)
     # wait=False + coalesce: быстрые нажатия через WAN не блокируют канал
-    link_rasb1.send(
+    link_motor().send(
         f"reverse_right {reverse_dir}",
         wait=False,
         coalesce_key="reverse_right",
     )
-    link_rasb1.send(
+    link_motor().send(
         f"gear_right {gear}",
         wait=False,
         coalesce_key="gear_right",
@@ -501,12 +536,12 @@ def set_gear_left(arg):
         gear = level  # 1→1, 2→2, 3→3
         reverse_dir = -1
     print(gear)
-    link_rasb1.send(
+    link_motor().send(
         f"reverse_left {reverse_dir}",
         wait=False,
         coalesce_key="reverse_left",
     )
-    link_rasb1.send(
+    link_motor().send(
         f"gear_left {gear}",
         wait=False,
         coalesce_key="gear_left",
@@ -562,11 +597,12 @@ def create_squares():
     total_width = (square_size * 2) + spacing + 250
 
     # Высота строго по содержимому (кружки + тумблеры + передачи) — место под миникарту сверху
-    # start_y=40, 5 кружков, напряжение, режим сети, блоки 7×40
+    # start_y=40, 5 кружков, напряжение, режим сети, режим стенда, блоки 7×40
     content_bottom = (
         40
         + 5 * circle_spacing
         + 10
+        + circle_spacing
         + circle_spacing
         + 40
         + num_squares * square_size
@@ -654,6 +690,7 @@ def create_squares():
     # Создаём информационную панель напряжения сети
     voltage_y = start_y + 5 * circle_spacing + 10
     network_mode_y = voltage_y + circle_spacing
+    stend_mode_y = network_mode_y + circle_spacing
 
     # Кружок для напряжения сети
     network_voltage_circle = canvas.create_oval(
@@ -688,6 +725,18 @@ def create_squares():
         font=("Arial", 10, "bold"), anchor="w"
     )
 
+    # Тумблер server3+serverrasb2 ↔ StendRasb2 (клавиша T)
+    stend_mode_circle = canvas.create_oval(
+        circle_x - circle_size // 2, stend_mode_y - circle_size // 2,
+        circle_x + circle_size // 2, stend_mode_y + circle_size // 2,
+        fill="lime", outline="white", width=2
+    )
+    stend_mode_text = canvas.create_text(
+        text_x, stend_mode_y,
+        text="Стенд: 2 Pi (T)", fill="white",
+        font=("Arial", 10, "bold"), anchor="w"
+    )
+
     # Рассчитываем центр для блоков квадратов
     blocks_width = (square_size * 2) + spacing
     blocks_start_x = (total_width - blocks_width) // 2
@@ -695,7 +744,7 @@ def create_squares():
     if blocks_start_x < text_x + 20:
         blocks_start_x = text_x + 20
 
-    block_start_y = network_mode_y + 40
+    block_start_y = stend_mode_y + 40
 
     # Создаём левый блок
     left_block_x = blocks_start_x
@@ -742,6 +791,21 @@ def create_squares():
             canvas.itemconfig(
                 network_mode_text,
                 text="Сеть: ЛОКАЛЬ (I) .21 / .20",
+            )
+
+    def update_stend_mode_display():
+        """Обновляет индикатор режима стенда (2 Pi / StendRasb2)."""
+        if use_unified_stend:
+            canvas.itemconfig(stend_mode_circle, fill="magenta")
+            canvas.itemconfig(
+                stend_mode_text,
+                text="Стенд: StendRasb2 (T)",
+            )
+        else:
+            canvas.itemconfig(stend_mode_circle, fill="lime")
+            canvas.itemconfig(
+                stend_mode_text,
+                text="Стенд: 2 Pi (T)",
             )
 
     def update_network_voltage_display():
@@ -1184,6 +1248,13 @@ def create_squares():
         update_network_mode_display()
         print(f"Переключено: {mode} | {ep1[0]}:{ep1[1]} / {ep2[0]}:{ep2[1]}")
 
+    def on_stend_mode_key():
+        toggle_stend_mode()
+        update_stend_mode_display()
+        update_network_mode_display()
+        stend = "StendRasb2" if use_unified_stend else "server3+serverrasb2"
+        print(f"Режим стенда: {stend}")
+
     def on_esc():
         root.destroy()
 
@@ -1206,6 +1277,7 @@ def create_squares():
     keyboard.add_hotkey("f", on_filter_key)
     keyboard.add_hotkey("n", on_network_voltage_key)
     keyboard.add_hotkey("i", on_network_mode_key)
+    keyboard.add_hotkey("t", on_stend_mode_key)
     keyboard.add_hotkey("esc", on_esc)
 
     print("Программа запущена!")
@@ -1231,7 +1303,8 @@ def create_squares():
     print('    - Красный → Зелёный: запрос параметров')
     print('    - Зелёный → Красный: сброс параметров')
     print('🟡 "N" - обновить отображение НАПРЯЖЕНИЯ СЕТИ')
-    print('🌐 "I" - тумблер СЕТИ: локаль (192.168.8.21 / .20) ↔ интернет (37.9.243.135)')
+    print('🌐 "I" - тумблер СЕТИ: локаль ↔ интернет (37.9.243.135)')
+    print('🔧 "T" - тумблер СТЕНДА: 2 Pi (server3+serverrasb2) ↔ StendRasb2')
     print('"ESC" - выход')
     print("=" * 70)
     print(f"НАПРЯЖЕНИЕ СЕТИ: {network_voltage} В (критическое: 21 В)")
@@ -1239,6 +1312,7 @@ def create_squares():
 
     # Начальное обновление
     update_network_mode_display()
+    update_stend_mode_display()
     update_network_voltage_display()
     update_all_circles()
     update_squares()
@@ -1284,4 +1358,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         link_rasb1.close()
         link_rasb2.close()
+        link_stend.close()
         print("Выход")
