@@ -10,6 +10,15 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+from stend_discovery import (
+    apply_layout,
+    current_gateway,
+    discover_stend,
+    layout_from_manual_host,
+    reset_manual_stend_mode,
+    set_manual_stend_mode,
+)
+
 # =============================================================================
 # Надёжный TCP-канал (вшит из reliable_net)
 # =============================================================================
@@ -282,10 +291,10 @@ class ReliableLink:
 
 # --- сеть: локальная LAN и внешний IP роутера (проброс портов) ---
 WAN_HOST = "37.9.243.135"
-# Локальные адреса Pi (как в port forwarding на роутере)
+# Локальные адреса Pi — fallback; в LAN подставляются автопоиском
 LOCAL_RASB1_HOST = "192.168.0.251"
 LOCAL_RASB2_HOST = "192.168.8.20"
-LOCAL_STEND_HOST = "192.168.8.20"  # единый StendRasb2 (server3 + serverrasb2)
+LOCAL_STEND_HOST = "192.168.8.20"
 PORT_RASB1 = 12345
 PORT_RASB2 = 12346
 PORT_STEND = 12345
@@ -298,7 +307,12 @@ port = PORT_RASB1
 port2 = PORT_RASB2
 
 use_wan = True  # False = локальная сеть, True = интернет через 37.9.243.135
-use_unified_stend = False  # False = server3 + serverrasb2, True = StendRasb2
+use_unified_stend = True  # True = один Pi (StendRasb1/2), False = server3 + serverrasb2
+
+
+def needs_rasb2() -> bool:
+    """Вторая Pi нужна только в режиме server3+serverrasb2."""
+    return not use_unified_stend
 
 # rasb1 / rasb2 / stend — постоянное соединение, OK|id / DUP|id (старт в режиме интернет)
 link_rasb1 = ReliableLink(WAN_HOST, PORT_RASB1, name="rasb1", one_shot=False)
@@ -326,8 +340,56 @@ def current_endpoints():
     return (LOCAL_RASB1_HOST, PORT_RASB1), (LOCAL_RASB2_HOST, PORT_RASB2)
 
 
-def apply_network_mode():
+def refresh_local_stend(*, progress=None) -> bool:
+    """Сканировать LAN и обновить адреса / тип стенда."""
+    layout = discover_stend(
+        quick_hosts=(LOCAL_RASB1_HOST, LOCAL_RASB2_HOST, LOCAL_STEND_HOST),
+        progress=progress,
+    )
+    if not layout:
+        return False
+    apply_layout(layout, globals(), respect_manual_mode=True)
+    return True
+
+
+def apply_manual_stend_ip(host: str) -> bool:
+    """Прописать стенд по IP, введённому вручную."""
+    layout = layout_from_manual_host(host)
+    if not layout:
+        print(f"Автопоиск: некорректный IP {host!r}")
+        return False
+    apply_layout(layout, globals(), respect_manual_mode=True)
+    print(f"Автопоиск (вручную): {layout.detail}")
+    return True
+
+
+def prompt_manual_stend_ip() -> bool:
+    """Диалог IP, если автопоиск LAN ничего не нашёл."""
+    gateway = current_gateway()
+    hint = f"\nТекущий шлюз: {gateway}" if gateway else ""
+    parent = _filter_ui.get("root")
+    kwargs = {}
+    if parent is not None:
+        kwargs["parent"] = parent
+    text = simpledialog.askstring(
+        "Стенд не найден",
+        "Автопоиск LAN ничего не нашёл."
+        f"{hint}\nВведите IP-адрес стенда (например 192.168.0.20):",
+        initialvalue=LOCAL_STEND_HOST,
+        **kwargs,
+    )
+    if not text:
+        print("Автопоиск: IP не введён")
+        return False
+    return apply_manual_stend_ip(text)
+
+
+def apply_network_mode(*, prompt_if_missing=False):
     """Применить use_wan и use_unified_stend к каналам."""
+    if not use_wan:
+        found = refresh_local_stend()
+        if not found and prompt_if_missing:
+            prompt_manual_stend_ip()
     ep1, ep2 = current_endpoints()
     if use_unified_stend:
         link_stend.set_endpoint(*ep1)
@@ -342,16 +404,19 @@ def apply_network_mode():
     return net, ep1, ep2
 
 
-def toggle_network_mode():
+def toggle_network_mode(*, prompt_if_missing=False):
     """Переключить локаль ↔ интернет."""
     global use_wan
     use_wan = not use_wan
-    return apply_network_mode()
+    if not use_wan:
+        reset_manual_stend_mode()
+    return apply_network_mode(prompt_if_missing=prompt_if_missing)
 
 
 def toggle_stend_mode():
-    """Переключить server3+serverrasb2 ↔ StendRasb2."""
+    """Переключить server3+serverrasb2 ↔ StendRasb2 (ручной режим)."""
     global use_unified_stend
+    set_manual_stend_mode()
     use_unified_stend = not use_unified_stend
     return apply_network_mode()
 
@@ -459,10 +524,10 @@ def Wake_On_Lan():
 
 
 def wake_UP():
-    """ONLINE — на StendRasb2 одно соединение, иначе на обе Pi параллельно."""
+    """ONLINE: единый стенд — один канал; иначе rasb1 + rasb2 параллельно."""
     if use_unified_stend:
         if not link_stend.keepalive("ONLINE"):
-            print("StendRasb2 офлайн")
+            print("Единый стенд офлайн")
         return
 
     results = {}
@@ -470,15 +535,16 @@ def wake_UP():
     def ping(name, link):
         results[name] = link.keepalive("ONLINE")
 
-    t1 = Thread(target=ping, args=("rasb1", link_rasb1), daemon=True)
-    t2 = Thread(target=ping, args=("rasb2", link_rasb2), daemon=True)
-    t1.start()
-    t2.start()
-    t1.join()
-    t2.join()
+    threads = [Thread(target=ping, args=("rasb1", link_rasb1), daemon=True)]
+    if needs_rasb2():
+        threads.append(Thread(target=ping, args=("rasb2", link_rasb2), daemon=True))
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
     if not results.get("rasb1"):
         print("Расбери 1 офлайн")
-    if not results.get("rasb2"):
+    if needs_rasb2() and not results.get("rasb2"):
         print("Расбери 2 офлайн")
 
 
@@ -1244,9 +1310,16 @@ def create_squares():
         update_network_voltage_display()
 
     def on_network_mode_key():
-        mode, ep1, ep2 = toggle_network_mode()
-        update_network_mode_display()
-        print(f"Переключено: {mode} | {ep1[0]}:{ep1[1]} / {ep2[0]}:{ep2[1]}")
+        def work():
+            mode, ep1, ep2 = toggle_network_mode(prompt_if_missing=True)
+            update_network_mode_display()
+            update_stend_mode_display()
+            if use_unified_stend:
+                print(f"Переключено: {mode} | стенд {ep1[0]}:{ep1[1]}")
+            else:
+                print(f"Переключено: {mode} | rasb1 {ep1[0]}:{ep1[1]} / rasb2 {ep2[0]}:{ep2[1]}")
+
+        root.after(0, work)
 
     def on_stend_mode_key():
         toggle_stend_mode()
@@ -1303,8 +1376,8 @@ def create_squares():
     print('    - Красный → Зелёный: запрос параметров')
     print('    - Зелёный → Красный: сброс параметров')
     print('🟡 "N" - обновить отображение НАПРЯЖЕНИЯ СЕТИ')
-    print('🌐 "I" - тумблер СЕТИ: локаль ↔ интернет (37.9.243.135)')
-    print('🔧 "T" - тумблер СТЕНДА: 2 Pi (server3+serverrasb2) ↔ StendRasb2')
+    print('🌐 "I" - тумблер СЕТИ: локаль (автопоиск Pi, иначе ввод IP) ↔ интернет')
+    print('🔧 "T" - тумблер СТЕНДА вручную: 2 Pi ↔ единый (иначе авто при I)')
     print('"ESC" - выход')
     print("=" * 70)
     print(f"НАПРЯЖЕНИЕ СЕТИ: {network_voltage} В (критическое: 21 В)")
@@ -1345,7 +1418,10 @@ def create_squares():
 if __name__ == "__main__":
     print("Надёжный канал: очередь + retry + keepalive + cmd_id")
     mode, ep1, ep2 = apply_network_mode()
-    print(f"Старт: {mode} | rasb1 {ep1[0]}:{ep1[1]} | rasb2 {ep2[0]}:{ep2[1]}")
+    if use_unified_stend:
+        print(f"Старт: {mode} | единый стенд {ep1[0]}:{ep1[1]} (rasb2 не используется)")
+    else:
+        print(f"Старт: {mode} | rasb1 {ep1[0]}:{ep1[1]} | rasb2 {ep2[0]}:{ep2[1]}")
 
     Thread(target=Wake_On_Lan, daemon=True).start()
     Thread(target=create_squares, daemon=True).start()

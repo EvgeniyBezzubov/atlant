@@ -30,8 +30,18 @@ from kivy.uix.popup import Popup
 from kivy.uix.textinput import TextInput
 from kivy.uix.widget import Widget
 
+from stend_discovery import (
+    apply_layout,
+    current_gateway,
+    discover_stend,
+    layout_from_manual_host,
+    reset_manual_stend_mode,
+    set_manual_stend_mode,
+)
+
 # --- сеть: локаль и интернет (проброс портов на роутере) ---
 WAN_HOST = "37.9.243.135"
+# fallback; в LAN подставляются автопоиском
 LOCAL_RASB1_HOST = "192.168.8.21"
 LOCAL_RASB2_HOST = "192.168.8.20"
 LOCAL_STEND_HOST = "192.168.8.20"
@@ -42,7 +52,31 @@ PORT_STEND = 12345
 # стартовые (интернет по умолчанию)
 RASB1_HOST = WAN_HOST
 RASB2_HOST = WAN_HOST
-use_unified_stend = False  # False = server3+serverrasb2, True = StendRasb2
+use_unified_stend = True  # True = один Pi (StendRasb1/2), False = server3+serverrasb2
+
+
+def needs_rasb2() -> bool:
+    return not use_unified_stend
+
+
+def refresh_local_stend(*, progress=None) -> bool:
+    layout = discover_stend(
+        quick_hosts=(LOCAL_RASB1_HOST, LOCAL_RASB2_HOST, LOCAL_STEND_HOST),
+        progress=progress,
+        verbose=False,
+    )
+    if not layout:
+        return False
+    apply_layout(layout, globals(), respect_manual_mode=True)
+    return True
+
+
+def apply_manual_stend_ip(host: str) -> bool:
+    layout = layout_from_manual_host(host)
+    if not layout:
+        return False
+    apply_layout(layout, globals(), respect_manual_mode=True)
+    return True
 
 COMMAND_TIMEOUT = 5.0
 COMMAND_RETRIES = 3
@@ -347,11 +381,12 @@ class MotorController:
                     self.link.send(
                         "ONLINE", wait=False, coalesce_key=f"{self.link.name}:keepalive"
                     )
-                    self.link_rasb2.send(
-                        "ONLINE",
-                        wait=False,
-                        coalesce_key=f"{self.link_rasb2.name}:keepalive",
-                    )
+                    if needs_rasb2():
+                        self.link_rasb2.send(
+                            "ONLINE",
+                            wait=False,
+                            coalesce_key=f"{self.link_rasb2.name}:keepalive",
+                        )
                 next_keepalive = time.monotonic() + KEEPALIVE_INTERVAL
 
     def _apply_level(self, side, previous, target):
@@ -417,6 +452,7 @@ class AuxController:
         self.filter_interval = FILTER_INTERVAL_SEC
         self.filter_pulse = FILTER_PULSE_SEC
         self._filter_dialog_open = False
+        self._ip_dialog_open = False
         self.lift_last_ok = None
         self.lift_busy = False
         self.use_wan = True  # False=локаль, True=интернет (по умолчанию)
@@ -486,12 +522,93 @@ class AuxController:
 
     def _toggle_stend(self):
         global use_unified_stend
+        set_manual_stend_mode()
         use_unified_stend = not use_unified_stend
         self._apply_endpoints()
         self._refresh_all_colors()
         stend = "StendRasb2" if use_unified_stend else "2 Pi"
-        self.status_callback(f"Стенд: {stend}")
+        self.status_callback(f"Стенд (вручную): {stend}")
         threading.Thread(target=self._probe_after_switch, daemon=True).start()
+
+    def _discover_local_and_apply(self):
+        def progress(msg: str):
+            Clock.schedule_once(lambda *_: self.status_callback(msg), 0)
+
+        found = refresh_local_stend(progress=progress)
+        Clock.schedule_once(lambda *_: self._after_local_discovery(found), 0)
+
+    def _after_local_discovery(self, found=True):
+        if not found:
+            self.status_callback("Стенд в LAN не найден — введите IP")
+            self._show_manual_ip_dialog()
+            return
+        self._finish_local_mode()
+
+    def _finish_local_mode(self):
+        self._apply_endpoints()
+        self._refresh_all_colors()
+        mode = "ИНТЕРНЕТ" if self.use_wan else "ЛОКАЛЬ"
+        if use_unified_stend:
+            self.status_callback(
+                f"Сеть: {mode} | единый стенд {LOCAL_STEND_HOST}:{PORT_STEND}"
+            )
+        else:
+            self.status_callback(
+                f"Сеть: {mode} | {LOCAL_RASB1_HOST}:{RASB1_PORT} / "
+                f"{LOCAL_RASB2_HOST}:{RASB2_PORT}"
+            )
+        threading.Thread(target=self._probe_after_switch, daemon=True).start()
+
+    def _show_manual_ip_dialog(self):
+        if self._ip_dialog_open:
+            return
+        self._ip_dialog_open = True
+        gateway = current_gateway()
+        hint = f"Шлюз: {gateway}" if gateway else "Автопоиск LAN ничего не нашёл"
+
+        content = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(12))
+        content.add_widget(
+            Label(
+                text=f"{hint}\nВведите IP стенда",
+                size_hint_y=None,
+                height=dp(48),
+            )
+        )
+        ip_input = TextInput(
+            text=LOCAL_STEND_HOST,
+            multiline=False,
+            size_hint_y=None,
+            height=dp(40),
+        )
+        content.add_widget(ip_input)
+
+        buttons = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
+        popup = Popup(
+            title="Стенд не найден",
+            content=content,
+            size_hint=(0.6, 0.55),
+            auto_dismiss=False,
+        )
+
+        def on_ok(*_):
+            if not apply_manual_stend_ip(ip_input.text):
+                self.status_callback("Некорректный IP — проверьте адрес")
+                return
+            self._ip_dialog_open = False
+            popup.dismiss()
+            self._finish_local_mode()
+
+        def on_cancel(*_):
+            self._ip_dialog_open = False
+            popup.dismiss()
+            self.status_callback("IP не введён — локальный режим без найденного стенда")
+            self._finish_local_mode()
+
+        buttons.add_widget(Button(text="OK", on_press=on_ok))
+        buttons.add_widget(Button(text="Отмена", on_press=on_cancel))
+        content.add_widget(buttons)
+        popup.open()
+        Clock.schedule_once(lambda *_: setattr(ip_input, "focus", True), 0.15)
 
     def _apply_endpoints(self):
         if use_unified_stend:
@@ -507,19 +624,22 @@ class AuxController:
 
     def _toggle_network(self):
         self.use_wan = not self.use_wan
-        self._apply_endpoints()
-        self._refresh_all_colors()
-        mode = "ИНТЕРНЕТ" if self.use_wan else "ЛОКАЛЬ"
-        if use_unified_stend:
-            host = WAN_HOST if self.use_wan else LOCAL_STEND_HOST
-            self.status_callback(f"Сеть: {mode} | StendRasb2 {host}:{PORT_STEND}")
-        else:
-            h1 = WAN_HOST if self.use_wan else LOCAL_RASB1_HOST
-            h2 = WAN_HOST if self.use_wan else LOCAL_RASB2_HOST
-            self.status_callback(
-                f"Сеть: {mode} | {h1}:{RASB1_PORT} / {h2}:{RASB2_PORT}"
-            )
-        threading.Thread(target=self._probe_after_switch, daemon=True).start()
+        if self.use_wan:
+            self._apply_endpoints()
+            self._refresh_all_colors()
+            mode = "ИНТЕРНЕТ"
+            if use_unified_stend:
+                self.status_callback(f"Сеть: {mode} | StendRasb2 {WAN_HOST}:{PORT_STEND}")
+            else:
+                self.status_callback(
+                    f"Сеть: {mode} | {WAN_HOST}:{RASB1_PORT} / {WAN_HOST}:{RASB2_PORT}"
+                )
+            threading.Thread(target=self._probe_after_switch, daemon=True).start()
+            return
+
+        reset_manual_stend_mode()
+        self.status_callback("Сканирование LAN…")
+        threading.Thread(target=self._discover_local_and_apply, daemon=True).start()
 
     def _probe_after_switch(self):
         if use_unified_stend:
@@ -528,14 +648,16 @@ class AuxController:
             )
             if ok:
                 mode = "ИНТЕРНЕТ" if self.use_wan else "ЛОКАЛЬ"
-                self.status_callback(f"StendRasb2 ({mode}): связь OK")
+                self.status_callback(f"Единый стенд ({mode}): связь OK")
             else:
                 self.status_callback(
-                    f"StendRasb2 нет связи: {self.link_stend._last_error or '?'}"
+                    f"Единый стенд нет связи: {self.link_stend._last_error or '?'}"
                 )
             return
         ok1 = self.link1.send("ONLINE", wait=True, coalesce_key="rasb1:keepalive")
-        ok2 = self.link2.send("ONLINE", wait=True, coalesce_key="rasb2:keepalive")
+        ok2 = True
+        if needs_rasb2():
+            ok2 = self.link2.send("ONLINE", wait=True, coalesce_key="rasb2:keepalive")
         if ok1 and ok2:
             mode = "ИНТЕРНЕТ" if self.use_wan else "ЛОКАЛЬ"
             self.status_callback(f"Сеть {mode}: связь OK")
@@ -543,7 +665,7 @@ class AuxController:
         parts = []
         if not ok1:
             parts.append(f"rasb1 {self.link1.host}:{self.link1.port}: {self.link1._last_error or '?'}")
-        if not ok2:
+        if needs_rasb2() and not ok2:
             parts.append(f"rasb2 {self.link2.host}:{self.link2.port}: {self.link2._last_error or '?'}")
         self.status_callback("Нет связи: " + "; ".join(parts))
 
@@ -1063,27 +1185,29 @@ class AtlantMotorApp(App):
         """Сразу показать, до кого доходим (и точную ошибку OS)."""
         if use_unified_stend:
             h, p = self.link_stend.host, self.link_stend.port
-            self._set_status(f"Проверка StendRasb2… {h}:{p}")
+            self._set_status(f"Проверка единого стенда… {h}:{p}")
             ok = self.link_stend.send("ONLINE", wait=True, coalesce_key="stend:keepalive")
             if ok:
-                self._set_status("Связь OK: StendRasb2")
+                self._set_status("Связь OK: единый стенд")
             else:
                 self._set_status(
-                    f"StendRasb2 нет связи: {self.link_stend._last_error or '?'}"
+                    f"Единый стенд нет связи: {self.link_stend._last_error or '?'}"
                 )
             return
         h1, p1 = self.link1.host, self.link1.port
         h2, p2 = self.link2.host, self.link2.port
         self._set_status(f"Проверка… {h1}:{p1} / {h2}:{p2}")
         ok1 = self.link1.send("ONLINE", wait=True, coalesce_key="rasb1:keepalive")
-        ok2 = self.link2.send("ONLINE", wait=True, coalesce_key="rasb2:keepalive")
+        ok2 = True
+        if needs_rasb2():
+            ok2 = self.link2.send("ONLINE", wait=True, coalesce_key="rasb2:keepalive")
         if ok1 and ok2:
             self._set_status("Связь OK: rasb1 и rasb2")
             return
         parts = []
         if not ok1:
             parts.append(f"rasb1 {h1}:{p1}: {self.link1._last_error or '?'}")
-        if not ok2:
+        if needs_rasb2() and not ok2:
             parts.append(f"rasb2 {h2}:{p2}: {self.link2._last_error or '?'}")
         self._set_status("Нет связи: " + "; ".join(parts))
 
