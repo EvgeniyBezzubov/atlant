@@ -330,6 +330,95 @@ def wait_for_network():
     print("Предупреждение: сетевой интерфейс wlan0 не обнаружен")
     return False
 
+def connect_to_wifi() -> bool:
+    """Подключает Raspberry Pi к Wi-Fi сети."""
+    if is_wifi_connected():
+        print(f"Wi-Fi уже подключен к {WIFI_SSID}")
+        return True
+
+    print(f"Попытка подключения к Wi-Fi сети: {WIFI_SSID}")
+
+    # Проверяем, существует ли файл конфигурации wpa_supplicant
+    wpa_conf = "/etc/wpa_supplicant/wpa_supplicant.conf"
+
+    # Проверяем, есть ли уже настройки для этой сети в конфиге
+    try:
+        with open(wpa_conf, 'r') as f:
+            content = f.read()
+            if WIFI_SSID in content:
+                print(f"Сеть {WIFI_SSID} уже настроена в wpa_supplicant")
+            else:
+                # Добавляем сеть в конфигурацию
+                network_config = f"""
+network={{
+    ssid="{WIFI_SSID}"
+    psk="{WIFI_PASSWORD}"
+    key_mgmt=WPA-PSK
+}}
+"""
+                with open(wpa_conf, 'a') as f:
+                    f.write(network_config)
+                print(f"Добавлена сеть {WIFI_SSID} в wpa_supplicant")
+    except Exception as e:
+        print(f"Не удалось прочитать/записать {wpa_conf}: {e}")
+        # Если не удалось изменить конфиг, пробуем через wpa_cli
+
+    # Пытаемся подключиться
+    try:
+        # Перезапускаем интерфейс wlan0
+        subprocess.run(["sudo", "ifdown", "wlan0"], capture_output=True)
+        time.sleep(2)
+        subprocess.run(["sudo", "ifup", "wlan0"], capture_output=True)
+        time.sleep(3)
+    except Exception as e:
+        print(f"Ошибка при перезапуске wlan0: {e}")
+
+    # Ждем подключения
+    for attempt in range(WIFI_MAX_RETRIES):
+        if is_wifi_connected():
+            print(f"Wi-Fi успешно подключен к {WIFI_SSID} (попытка {attempt + 1})")
+            return True
+
+        print(f"Ожидание подключения к Wi-Fi... (попытка {attempt + 1}/{WIFI_MAX_RETRIES})")
+
+        # Альтернативный способ подключения через wpa_cli
+        if attempt % 3 == 0:
+            try:
+                # Пересканируем сети
+                subprocess.run(["sudo", "wpa_cli", "scan"], capture_output=True)
+                time.sleep(2)
+                subprocess.run(["sudo", "wpa_cli", "scan_results"], capture_output=True)
+
+                # Пытаемся подключиться к сети
+                subprocess.run([
+                    "sudo", "wpa_cli", "add_network"
+                ], capture_output=True)
+
+                subprocess.run([
+                    "sudo", "wpa_cli", "set_network", "0", "ssid", f'"{WIFI_SSID}"'
+                ], capture_output=True)
+
+                subprocess.run([
+                    "sudo", "wpa_cli", "set_network", "0", "psk", f'"{WIFI_PASSWORD}"'
+                ], capture_output=True)
+
+                subprocess.run([
+                    "sudo", "wpa_cli", "select_network", "0"
+                ], capture_output=True)
+
+                subprocess.run([
+                    "sudo", "wpa_cli", "enable_network", "0"
+                ], capture_output=True)
+
+                subprocess.run(["sudo", "dhclient", "wlan0"], capture_output=True)
+            except Exception as e:
+                print(f"Ошибка при использовании wpa_cli: {e}")
+
+        time.sleep(WIFI_CHECK_INTERVAL)
+
+    print("Не удалось подключиться к Wi-Fi")
+    return False
+
 def main() -> None:
 
     # Шаг 1: Ожидаем появления сетевого интерфейса
