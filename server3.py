@@ -2,6 +2,7 @@
 """
 Сервер Raspberry Pi (rasb1 / server3): передачи, реверс, усы, реле.
 Постоянное TCP-соединение, cmd_id, ответы OK|id / DUP|id / ERR|id|msg.
+С предварительным подключением к Wi-Fi.
 """
 
 from __future__ import annotations
@@ -9,12 +10,126 @@ from __future__ import annotations
 import socket
 import threading
 import time
+import subprocess
+import sys
+import os
 from typing import Optional
 
 import RPi.GPIO as GPIO
 
+# --- Wi-Fi настройки ---
+WIFI_SSID = "HUAWEI_B535_586A"  # Замените на ваш SSID
+WIFI_PASSWORD = "19720708"  # Замените на ваш пароль
+WIFI_MAX_RETRIES = 30
+WIFI_RETRY_DELAY = 5  # секунд между попытками
+WIFI_CHECK_INTERVAL = 2  # секунды между проверками подключения
+
 # --- сеть ---
 PORT = 12345
+
+
+def is_wifi_connected() -> bool:
+    """Проверяет, подключен ли Raspberry Pi к Wi-Fi."""
+    try:
+        # Проверяем наличие IP адреса на wlan0
+        result = subprocess.run(
+            ["ip", "addr", "show", "wlan0"],
+            capture_output=True,
+            text=True
+        )
+        return "inet " in result.stdout
+    except Exception:
+        return False
+
+
+def connect_to_wifi() -> bool:
+    """Подключает Raspberry Pi к Wi-Fi сети."""
+    if is_wifi_connected():
+        print(f"Wi-Fi уже подключен к {WIFI_SSID}")
+        return True
+
+    print(f"Попытка подключения к Wi-Fi сети: {WIFI_SSID}")
+
+    # Проверяем, существует ли файл конфигурации wpa_supplicant
+    wpa_conf = "/etc/wpa_supplicant/wpa_supplicant.conf"
+
+    # Проверяем, есть ли уже настройки для этой сети в конфиге
+    try:
+        with open(wpa_conf, 'r') as f:
+            content = f.read()
+            if WIFI_SSID in content:
+                print(f"Сеть {WIFI_SSID} уже настроена в wpa_supplicant")
+            else:
+                # Добавляем сеть в конфигурацию
+                network_config = f"""
+network={{
+    ssid="{WIFI_SSID}"
+    psk="{WIFI_PASSWORD}"
+    key_mgmt=WPA-PSK
+}}
+"""
+                with open(wpa_conf, 'a') as f:
+                    f.write(network_config)
+                print(f"Добавлена сеть {WIFI_SSID} в wpa_supplicant")
+    except Exception as e:
+        print(f"Не удалось прочитать/записать {wpa_conf}: {e}")
+        # Если не удалось изменить конфиг, пробуем через wpa_cli
+
+    # Пытаемся подключиться
+    try:
+        # Перезапускаем интерфейс wlan0
+        subprocess.run(["sudo", "ifdown", "wlan0"], capture_output=True)
+        time.sleep(2)
+        subprocess.run(["sudo", "ifup", "wlan0"], capture_output=True)
+        time.sleep(3)
+    except Exception as e:
+        print(f"Ошибка при перезапуске wlan0: {e}")
+
+    # Ждем подключения
+    for attempt in range(WIFI_MAX_RETRIES):
+        if is_wifi_connected():
+            print(f"Wi-Fi успешно подключен к {WIFI_SSID} (попытка {attempt + 1})")
+            return True
+
+        print(f"Ожидание подключения к Wi-Fi... (попытка {attempt + 1}/{WIFI_MAX_RETRIES})")
+
+        # Альтернативный способ подключения через wpa_cli
+        if attempt % 3 == 0:
+            try:
+                # Пересканируем сети
+                subprocess.run(["sudo", "wpa_cli", "scan"], capture_output=True)
+                time.sleep(2)
+                subprocess.run(["sudo", "wpa_cli", "scan_results"], capture_output=True)
+
+                # Пытаемся подключиться к сети
+                subprocess.run([
+                    "sudo", "wpa_cli", "add_network"
+                ], capture_output=True)
+
+                subprocess.run([
+                    "sudo", "wpa_cli", "set_network", "0", "ssid", f'"{WIFI_SSID}"'
+                ], capture_output=True)
+
+                subprocess.run([
+                    "sudo", "wpa_cli", "set_network", "0", "psk", f'"{WIFI_PASSWORD}"'
+                ], capture_output=True)
+
+                subprocess.run([
+                    "sudo", "wpa_cli", "select_network", "0"
+                ], capture_output=True)
+
+                subprocess.run([
+                    "sudo", "wpa_cli", "enable_network", "0"
+                ], capture_output=True)
+
+                subprocess.run(["sudo", "dhclient", "wlan0"], capture_output=True)
+            except Exception as e:
+                print(f"Ошибка при использовании wpa_cli: {e}")
+
+        time.sleep(WIFI_CHECK_INTERVAL)
+
+    print("Не удалось подключиться к Wi-Fi")
+    return False
 
 
 def get_local_ip() -> str:
@@ -36,11 +151,12 @@ def resolve_bind_host() -> str:
     if ip and ip != "127.0.0.1":
         return ip
     return "0.0.0.0"
+
+
 IDLE_CONN_TIMEOUT = 90.0  # закрыть клиента, если молчит дольше (ONLINE держит живым)
 INACTIVITY_SEC = 5.0  # без команд → пины в HIGH
 
 # --- GPIO pin numbers (BCM) ---
-# 4/5 скорости сняты: не инициализируем GPIO5(2KOM), GPIO27(0.1KOM), GPIO6(2KOM), GPIO12(0.1KOM)
 GPIO4 = 4  ###relle 13   4KOM 1st
 GPIO17 = 17  ###relle 8 	revers2
 GPIO22 = 22  ###relle 3		3.3kom 2nd
@@ -215,7 +331,7 @@ def set_gear_right(level: int) -> None:
     if level == 0:
         GPIO.output(GPIO13, GPIO.HIGH)  # 5KOM
         GPIO.output(GPIO26, GPIO.HIGH)  # 4.5KOM
-        GPIO.output(GPIO4, GPIO.HIGH)   # 4KOM
+        GPIO.output(GPIO4, GPIO.HIGH)  # 4KOM
         GPIO.output(GPIO25, GPIO.HIGH)  # 3.3KOM
     elif level == 1:
         GPIO.output(GPIO13, GPIO.LOW)
@@ -391,7 +507,45 @@ def handle_client(conn: socket.socket, addr) -> None:
         print(f"client closed: {addr}")
 
 
+def wait_for_network():
+    """Ожидает появления сетевого интерфейса wlan0."""
+    print("Ожидание сетевого интерфейса wlan0...")
+    max_wait = 30
+    for _ in range(max_wait):
+        try:
+            result = subprocess.run(
+                ["ip", "link", "show", "wlan0"],
+                capture_output=True,
+                text=True
+            )
+            if "wlan0:" in result.stdout:
+                print("Сетевой интерфейс wlan0 обнаружен")
+                return True
+        except Exception:
+            pass
+        time.sleep(1)
+    print("Предупреждение: сетевой интерфейс wlan0 не обнаружен")
+    return False
+
+
 def main() -> None:
+    # Шаг 1: Ожидаем появления сетевого интерфейса
+    wait_for_network()
+
+    # Шаг 2: Подключаемся к Wi-Fi
+    print("\n=== ПОДКЛЮЧЕНИЕ К WI-FI ===")
+    if not connect_to_wifi():
+        print("КРИТИЧЕСКАЯ ОШИБКА: Не удалось подключиться к Wi-Fi")
+        print("Продолжаем работу с существующим подключением или без сети")
+
+    # Шаг 3: Показываем IP адрес
+    ip = get_local_ip()
+    print(f"\n=== СЕРВЕР ЗАПУЩЕН ===")
+    print(f"IP адрес: {ip}")
+    print(f"Порт: {PORT}")
+    print("=" * 30 + "\n")
+
+    # Шаг 4: Запускаем основной код сервера
     monitor = threading.Thread(target=monitor_inactivity, daemon=True)
     monitor.start()
 
@@ -401,7 +555,7 @@ def main() -> None:
     enable_keepalive(server)
     server.bind((host, PORT))
     server.listen(8)
-    print(f"server run on {host}:{PORT} (persistent)")
+    print(f"Сервер запущен на {host}:{PORT} (постоянное соединение)")
 
     try:
         while True:
@@ -410,7 +564,7 @@ def main() -> None:
                 target=handle_client, args=(client, addr), daemon=True
             ).start()
     except KeyboardInterrupt:
-        print("stopping...")
+        print("Остановка сервера...")
     finally:
         global monitoring_active
         monitoring_active = False

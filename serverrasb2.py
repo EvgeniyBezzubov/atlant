@@ -16,6 +16,13 @@ from typing import Optional
 
 import RPi.GPIO as GPIO
 
+# --- Wi-Fi настройки ---
+WIFI_SSID = "HUAWEI_B535_586A"  # Замените на ваш SSID
+WIFI_PASSWORD = "19720708"  # Замените на ваш пароль
+WIFI_MAX_RETRIES = 30
+WIFI_RETRY_DELAY = 5  # секунд между попытками
+WIFI_CHECK_INTERVAL = 2  # секунды между проверками подключения
+
 # --- сеть ---
 PORT = 12346
 
@@ -303,8 +310,45 @@ def handle_client(conn: socket.socket, addr) -> None:
             pass
         print(f"client closed: {addr}")
 
+def wait_for_network():
+    """Ожидает появления сетевого интерфейса wlan0."""
+    print("Ожидание сетевого интерфейса wlan0...")
+    max_wait = 30
+    for _ in range(max_wait):
+        try:
+            result = subprocess.run(
+                ["ip", "link", "show", "wlan0"],
+                capture_output=True,
+                text=True
+            )
+            if "wlan0:" in result.stdout:
+                print("Сетевой интерфейс wlan0 обнаружен")
+                return True
+        except Exception:
+            pass
+        time.sleep(1)
+    print("Предупреждение: сетевой интерфейс wlan0 не обнаружен")
+    return False
 
 def main() -> None:
+
+    # Шаг 1: Ожидаем появления сетевого интерфейса
+    wait_for_network()
+
+    # Шаг 2: Подключаемся к Wi-Fi
+    print("\n=== ПОДКЛЮЧЕНИЕ К WI-FI ===")
+    if not connect_to_wifi():
+        print("КРИТИЧЕСКАЯ ОШИБКА: Не удалось подключиться к Wi-Fi")
+        print("Продолжаем работу с существующим подключением или без сети")
+
+    # Шаг 3: Показываем IP адрес
+    ip = get_local_ip()
+    print(f"\n=== СЕРВЕР ЗАПУЩЕН ===")
+    print(f"IP адрес: {ip}")
+    print(f"Порт: {PORT}")
+    print("=" * 30 + "\n")
+
+
     monitor = threading.Thread(target=monitor_inactivity, daemon=True)
     monitor.start()
 

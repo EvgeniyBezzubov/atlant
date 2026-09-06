@@ -214,13 +214,23 @@ def layout_from_manual_host(host: str) -> Optional[StendLayout]:
 def _pick_host(hosts: set[str]) -> Optional[str]:
     if not hosts:
         return None
-    return sorted(hosts)[0]
+    return sorted(hosts, key=lambda ip: tuple(int(p) for p in ip.split(".")))[0]
 
 
 def _layout_from_sets(motor_hosts: set[str], aux_hosts: set[str]) -> Optional[StendLayout]:
+    """Собрать layout только по реальным ответам ONLINE на каждом порту.
+
+    rasb1 = хост, ответивший на 12345; rasb2 = хост, ответивший на 12346.
+    Нельзя подставлять IP aux в motor (и наоборот): иначе две Pi с разными
+    адресами схлопываются в один IP с разными портами.
+    """
+    motor_only = motor_hosts - aux_hosts
+    aux_only = aux_hosts - motor_hosts
+    both = motor_hosts & aux_hosts
+
     if aux_hosts:
-        motor = _pick_host(motor_hosts) or _pick_host(aux_hosts)
-        aux = _pick_host(aux_hosts)
+        motor = _pick_host(motor_only) or _pick_host(both)
+        aux = _pick_host(aux_only) or _pick_host(both)
         if not motor or not aux:
             return None
         return StendLayout(
@@ -248,12 +258,8 @@ def _scan_hosts(
     motor_hosts: set[str] = set()
     aux_hosts: set[str] = set()
 
-    def check_host(ip: str) -> tuple[str, Optional[str]]:
-        if probe_online(ip, PORT_MOTOR):
-            return ip, "motor"
-        if probe_online(ip, PORT_AUX):
-            return ip, "aux"
-        return ip, None
+    def check_host(ip: str) -> tuple[str, bool, bool]:
+        return ip, probe_online(ip, PORT_MOTOR), probe_online(ip, PORT_AUX)
 
     done = 0
     total = len(hosts)
@@ -263,10 +269,10 @@ def _scan_hosts(
             done += 1
             if progress and done % 32 == 0:
                 progress(f"Сканирование LAN… {done}/{total}")
-            ip, kind = fut.result()
-            if kind == "motor":
+            ip, motor_ok, aux_ok = fut.result()
+            if motor_ok:
                 motor_hosts.add(ip)
-            elif kind == "aux":
+            if aux_ok:
                 aux_hosts.add(ip)
     return motor_hosts, aux_hosts
 
@@ -288,11 +294,14 @@ def discover_stend(
         if probe_online(host, PORT_AUX):
             aux_quick.add(host)
 
-    quick_layout = _layout_from_sets(motor_quick, aux_quick)
-    if quick_layout:
-        if verbose:
-            print(f"Автопоиск (быстро): {quick_layout.detail}")
-        return quick_layout
+    # Быстрый путь только если нашли ответы на оба порта. Один aux
+    # (rasb2) без motor нельзя принимать: раньше motor получал тот же IP.
+    if motor_quick and aux_quick:
+        quick_layout = _layout_from_sets(motor_quick, aux_quick)
+        if quick_layout:
+            if verbose:
+                print(f"Автопоиск (быстро): {quick_layout.detail}")
+            return quick_layout
 
     prefixes = scan_subnet_prefixes()
     if not prefixes:
@@ -308,6 +317,8 @@ def discover_stend(
         progress(f"Сканирование {prefixes[0]}.* …")
 
     motor_hosts, aux_hosts = _scan_hosts(hosts, progress=progress)
+    motor_hosts |= motor_quick
+    aux_hosts |= aux_quick
     layout = _layout_from_sets(motor_hosts, aux_hosts)
     if layout:
         if verbose:

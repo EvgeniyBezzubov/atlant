@@ -292,9 +292,9 @@ class ReliableLink:
 # --- сеть: локальная LAN и внешний IP роутера (проброс портов) ---
 WAN_HOST = "37.9.243.135"
 # Локальные адреса Pi — fallback; в LAN подставляются автопоиском
-LOCAL_RASB1_HOST = "192.168.0.251"
+LOCAL_RASB1_HOST = "192.168.8.21"
 LOCAL_RASB2_HOST = "192.168.8.20"
-LOCAL_STEND_HOST = "192.168.8.20"
+LOCAL_STEND_HOST = "192.168.8.21"
 PORT_RASB1 = 12345
 PORT_RASB2 = 12346
 PORT_STEND = 12345
