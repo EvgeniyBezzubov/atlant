@@ -419,6 +419,19 @@ network={{
     print("Не удалось подключиться к Wi-Fi")
     return False
 
+def is_wifi_connected() -> bool:
+    """Проверяет, подключен ли Raspberry Pi к Wi-Fi."""
+    try:
+        # Проверяем наличие IP адреса на wlan0
+        result = subprocess.run(
+            ["ip", "addr", "show", "wlan0"],
+            capture_output=True,
+            text=True
+        )
+        return "inet " in result.stdout
+    except Exception:
+        return False
+
 def main() -> None:
 
     # Шаг 1: Ожидаем появления сетевого интерфейса
