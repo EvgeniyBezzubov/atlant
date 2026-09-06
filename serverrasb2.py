@@ -19,8 +19,8 @@ import RPi.GPIO as GPIO
 # --- Wi-Fi настройки ---
 WIFI_SSID = "HUAWEI_B535_586A"  # Замените на ваш SSID
 WIFI_PASSWORD = "19720708"  # Замените на ваш пароль
-WIFI_MAX_RETRIES = 30
-WIFI_RETRY_DELAY = 5  # секунд между попытками
+WIFI_MAX_RETRIES = 100
+WIFI_RETRY_DELAY = 10  # секунд между попытками
 WIFI_CHECK_INTERVAL = 2  # секунды между проверками подключения
 
 # --- сеть ---
