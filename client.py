@@ -312,7 +312,7 @@ port2 = PORT_RASB2
 use_wan = True  # False = локальная сеть, True = интернет через 37.9.243.135
 use_unified_stend = True  # True = один Pi (StendRasb1/2), False = server3 + serverrasb2
 
-ARDUINO_BASE = "http://192.168.4.1"
+ARDUINO_BASE = "http://192.168.8.54"
 ARDUINO_TIMEOUT = 0.35
 VOLTAGE_CRITICAL_V = 21.0
 
