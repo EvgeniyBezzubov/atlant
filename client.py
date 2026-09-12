@@ -1,3 +1,4 @@
+import json
 import tkinter as tk
 from tkinter import simpledialog
 import keyboard
@@ -9,6 +10,8 @@ import socket
 import uuid
 from dataclasses import dataclass, field
 from typing import Callable, Optional
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 from stend_discovery import (
     apply_layout,
@@ -309,6 +312,10 @@ port2 = PORT_RASB2
 use_wan = True  # False = локальная сеть, True = интернет через 37.9.243.135
 use_unified_stend = True  # True = один Pi (StendRasb1/2), False = server3 + serverrasb2
 
+ARDUINO_BASE = "http://192.168.4.1"
+ARDUINO_TIMEOUT = 0.35
+VOLTAGE_CRITICAL_V = 21.0
+
 
 def needs_rasb2() -> bool:
     """Вторая Pi нужна только в режиме server3+serverrasb2."""
@@ -503,18 +510,29 @@ def Start_filtr_ochistki():
             time.sleep(0.5)
 
 
-def call_arduino(text=""):
-    # Отправка запроса
-    # response = requests.get('http://192.168.0.170'+text)
-    # response = requests.get('http://37.9.243.135', timeout=2)
-    # # Получение текста ответа
-    # Uon1stAkkumIdStart = response.text.find("Voltage")
-    # Uon1stAkkumIdEnd = response.text.find("endU1")
-    # string_value = response.text[Uon1stAkkumIdStart + 9:Uon1stAkkumIdStart + 14]
-    # cleaned_string = string_value.strip()  # удаляем пробелы в начале и конце
-    # number = float(cleaned_string) * 1.027
-    return 1
-    # print("Напряжение питания: " + str(number))
+def _arduino_get(path: str) -> Optional[dict]:
+    url = ARDUINO_BASE.rstrip("/") + path
+    req = Request(url, headers={"User-Agent": "AtlantClient/1.0"})
+    try:
+        with urlopen(req, timeout=ARDUINO_TIMEOUT) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except (URLError, TimeoutError, ValueError, OSError):
+        return None
+
+
+def fetch_arduino_gps() -> Optional[dict]:
+    """GET /gps — lat, lon, course, fix."""
+    return _arduino_get("/gps")
+
+
+def fetch_arduino_a0() -> Optional[dict]:
+    """GET /a0 — напряжение на A0."""
+    return _arduino_get("/a0")
+
+
+def fetch_arduino_a1() -> Optional[dict]:
+    """GET /a1 — напряжение на A1."""
+    return _arduino_get("/a1")
 
 
 def Wake_On_Lan():
@@ -645,8 +663,9 @@ def create_squares():
     filter_interval = ""  # Интервал включения
     filter_period = ""  # Период включения
 
-    # Параметры напряжения сети
-    network_voltage = 26  # Напряжение сети (захардкожено 26)
+    # Напряжения с Arduino A0 / A1
+    voltage_a0 = None
+    voltage_a1 = None
 
     # Уровни для левого и правого блока (теперь от -3 до +3)
     left_level = 0  # -3, -2, -1, 0, 1, 2, 3
@@ -663,11 +682,12 @@ def create_squares():
     total_width = (square_size * 2) + spacing + 250
 
     # Высота строго по содержимому (кружки + тумблеры + передачи) — место под миникарту сверху
-    # start_y=40, 5 кружков, напряжение, режим сети, режим стенда, блоки 7×40
+    # start_y=40, 5 кружков, A0, A1, режим сети, режим стенда, блоки 7×40
     content_bottom = (
         40
         + 5 * circle_spacing
         + 10
+        + circle_spacing
         + circle_spacing
         + circle_spacing
         + 40
@@ -753,30 +773,31 @@ def create_squares():
             )
         texts.append(text)
 
-    # Создаём информационную панель напряжения сети
-    voltage_y = start_y + 5 * circle_spacing + 10
-    network_mode_y = voltage_y + circle_spacing
+    voltage_a0_y = start_y + 5 * circle_spacing + 10
+    voltage_a1_y = voltage_a0_y + circle_spacing
+    network_mode_y = voltage_a1_y + circle_spacing
     stend_mode_y = network_mode_y + circle_spacing
 
-    # Кружок для напряжения сети
-    network_voltage_circle = canvas.create_oval(
-        circle_x - circle_size // 2, voltage_y - circle_size // 2,
-        circle_x + circle_size // 2, voltage_y + circle_size // 2,
-        fill="green", outline="white", width=2
+    voltage_a0_circle = canvas.create_oval(
+        circle_x - circle_size // 2, voltage_a0_y - circle_size // 2,
+        circle_x + circle_size // 2, voltage_a0_y + circle_size // 2,
+        fill="gray", outline="white", width=2
     )
-
-    # Текст для напряжения сети
-    network_voltage_text = canvas.create_text(
-        text_x, voltage_y,
-        text=f"Напряжение сети: {network_voltage} В", fill="white",
+    voltage_a0_text = canvas.create_text(
+        text_x, voltage_a0_y,
+        text="Напряжение A0: — В", fill="white",
         font=("Arial", 10, "bold"), anchor="w"
     )
 
-    # Подпись клавиши обновления
-    canvas.create_text(
-        text_x + 200, voltage_y,
-        text="(N - обновить)", fill="white",
-        font=("Arial", 8, "italic"), anchor="w"
+    voltage_a1_circle = canvas.create_oval(
+        circle_x - circle_size // 2, voltage_a1_y - circle_size // 2,
+        circle_x + circle_size // 2, voltage_a1_y + circle_size // 2,
+        fill="gray", outline="white", width=2
+    )
+    voltage_a1_text = canvas.create_text(
+        text_x, voltage_a1_y,
+        text="Напряжение A1: — В", fill="white",
+        font=("Arial", 10, "bold"), anchor="w"
     )
 
     # Тумблер локаль ↔ интернет (клавиша I; P занята помпой)
@@ -874,17 +895,65 @@ def create_squares():
                 text="Стенд: 2 Pi (T)",
             )
 
-    def update_network_voltage_display():
-        """Обновляет отображение напряжения сети и цвет кружка"""
-        network_voltage = round(call_arduino(), 3)
-        canvas.itemconfig(network_voltage_text, text=f"Напряжение сети: {network_voltage} В")
+    def _set_voltage_row(circle_id, text_id, label, value):
+        if value is None:
+            canvas.itemconfig(text_id, text=f"{label}: — В")
+            canvas.itemconfig(circle_id, fill="gray")
+            return
+        volts = round(float(value), 3)
+        canvas.itemconfig(text_id, text=f"{label}: {volts} В")
+        canvas.itemconfig(
+            circle_id, fill="red" if volts <= VOLTAGE_CRITICAL_V else "green"
+        )
 
-        if network_voltage <= 21:
-            canvas.itemconfig(network_voltage_circle, fill="red")
-            print(f"Напряжение сети: {network_voltage} В (КРАСНЫЙ - критическое значение!)")
-        else:
-            canvas.itemconfig(network_voltage_circle, fill="green")
-            print(f"Напряжение сети: {network_voltage} В (норма)")
+    def update_voltage_display():
+        _set_voltage_row(voltage_a0_circle, voltage_a0_text, "Напряжение A0", voltage_a0)
+        _set_voltage_row(voltage_a1_circle, voltage_a1_text, "Напряжение A1", voltage_a1)
+
+    def apply_arduino_telemetry(gps, a0, a1):
+        nonlocal voltage_a0, voltage_a1
+        if a0 and "volt" in a0:
+            voltage_a0 = a0["volt"]
+        elif a0 is None:
+            voltage_a0 = None
+        if a1 and "volt" in a1:
+            voltage_a1 = a1["volt"]
+        elif a1 is None:
+            voltage_a1 = None
+        update_voltage_display()
+
+        if not gps:
+            return
+        if not gps.get("fix"):
+            return
+        try:
+            lat = float(gps["lat"])
+            lon = float(gps["lon"])
+        except (KeyError, TypeError, ValueError):
+            return
+        heading = gps.get("course")
+        try:
+            heading = float(heading) if heading is not None else None
+        except (TypeError, ValueError):
+            heading = None
+        mm = getattr(root, "_minimap", None)
+        if mm is not None:
+            mm.apply_live_gps(lat, lon, heading)
+
+    def arduino_poll_loop():
+        while True:
+            t0 = time.time()
+            gps = fetch_arduino_gps()
+            a0 = fetch_arduino_a0()
+            a1 = fetch_arduino_a1()
+            try:
+                root.after(
+                    0,
+                    lambda g=gps, v0=a0, v1=a1: apply_arduino_telemetry(g, v0, v1),
+                )
+            except tk.TclError:
+                break
+            time.sleep(max(0.0, 0.5 - (time.time() - t0)))
 
     def update_filter_display():
         """Обновляет отображение текста фильтра с параметрами"""
@@ -1306,9 +1375,6 @@ def create_squares():
             update_circle(4, filter_level, "2state")
             print(f"Фильтр тонкой очистки: {['красный', 'зелёный'][filter_level]}")
 
-    def on_network_voltage_key():
-        update_network_voltage_display()
-
     def on_network_mode_key():
         def work():
             mode, ep1, ep2 = toggle_network_mode(prompt_if_missing=True)
@@ -1348,7 +1414,6 @@ def create_squares():
     keyboard.add_hotkey("j", on_lift_key_down)
     keyboard.add_hotkey("p", on_pump_key)
     keyboard.add_hotkey("f", on_filter_key)
-    keyboard.add_hotkey("n", on_network_voltage_key)
     keyboard.add_hotkey("i", on_network_mode_key)
     keyboard.add_hotkey("t", on_stend_mode_key)
     keyboard.add_hotkey("esc", on_esc)
@@ -1375,18 +1440,17 @@ def create_squares():
     print('🟡 "F" - переключение ФИЛЬТРА:')
     print('    - Красный → Зелёный: запрос параметров')
     print('    - Зелёный → Красный: сброс параметров')
-    print('🟡 "N" - обновить отображение НАПРЯЖЕНИЯ СЕТИ')
     print('🌐 "I" - тумблер СЕТИ: локаль (автопоиск Pi, иначе ввод IP) ↔ интернет')
     print('🔧 "T" - тумблер СТЕНДА вручную: 2 Pi ↔ единый (иначе авто при I)')
     print('"ESC" - выход')
     print("=" * 70)
-    print(f"НАПРЯЖЕНИЕ СЕТИ: {network_voltage} В (критическое: 21 В)")
+    print(f"Arduino {ARDUINO_BASE} — GPS /a0 /a1, 2 Гц, порог {VOLTAGE_CRITICAL_V} В")
     print("=" * 70)
 
     # Начальное обновление
     update_network_mode_display()
     update_stend_mode_display()
-    update_network_voltage_display()
+    update_voltage_display()
     update_all_circles()
     update_squares()
 
@@ -1411,6 +1475,8 @@ def create_squares():
         )
     except Exception as e:
         print(f"Миникарта не запущена: {e}")
+
+    Thread(target=arduino_poll_loop, daemon=True, name="ArduinoPoll").start()
 
     root.mainloop()
 

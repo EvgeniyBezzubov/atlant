@@ -683,6 +683,27 @@ class MiniMapApp:
         self._set_alert(self.zone is not None and not self.zone.contains(lat, lon))
         self.reload_view()
 
+    def apply_live_gps(
+        self, lat: float, lon: float, heading: float | None = None, *, follow: bool = True
+    ) -> None:
+        """Точка и автопилот с GPS; карта следует за позицией, если не идёт сдвиг."""
+        self.pin_lat, self.pin_lon = lat, lon
+        self.pin_heading = heading
+        self.autopilot.update_pose(lat, lon, heading)
+        if follow and not self._panning:
+            self.center_lat, self.center_lon = lat, lon
+        focused = self.root.focus_get()
+        if focused is not self.entry and focused is not self.home_entry:
+            if heading is not None:
+                text = f"{lon:.6f},{lat:.6f},{heading:.0f}"
+            else:
+                text = f"{lon:.6f},{lat:.6f}"
+            if self.entry.get() != text:
+                self.entry.delete(0, tk.END)
+                self.entry.insert(0, text)
+        self._set_alert(self.zone is not None and not self.zone.contains(lat, lon))
+        self._schedule_reload(delay_ms=50)
+
     # --- pan / zoom / zone input ---
 
     def _clear_drag_rect(self) -> None:
