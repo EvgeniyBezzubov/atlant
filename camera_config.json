@@ -1,0 +1,22 @@
+{
+  "cameras": [
+    {
+      "id": 0,
+      "name": "Камера 1",
+      "ip": "37.9.243.135",
+      "port": 1554,
+      "login": "admin",
+      "password": "19720708Aa",
+      "enabled": true
+    },
+    {
+      "id": 1,
+      "name": "Камера",
+      "ip": "22222",
+      "port": 554,
+      "login": "admin",
+      "password": "323132323",
+      "enabled": true
+    }
+  ]
+}
