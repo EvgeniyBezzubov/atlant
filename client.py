@@ -1456,7 +1456,7 @@ def create_squares():
 
     # Миникарта + автопилот (после update_squares — есть left/right_level)
     try:
-        from show_map import MiniMapApp
+        from show_map_new import MiniMapApp
 
         def sync_motor_ui(left: int, right: int) -> None:
             nonlocal left_level, right_level

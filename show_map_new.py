@@ -219,61 +219,92 @@ class Zone:
         self.max_lat = max(lat1, lat2)
         self.min_lon = min(lon1, lon2)
         self.max_lon = max(lon1, lon2)
+        self.root.after(150, self._force_embedded_geometry)
 
     def contains(self, lat: float, lon: float) -> bool:
         return self.min_lat <= lat <= self.max_lat and self.min_lon <= lon <= self.max_lon
 
+    def _force_embedded_geometry(self) -> None:
+        """В embedded-режиме — принудительно обновляем размеры и перерисовываем."""
+        if not self._embedded:
+            return
+        try:
+            self.root.update_idletasks()
+            self.frame.update_idletasks()
+            self.canvas.update_idletasks()
+            # Перерисовываем карту после того, как Tk посчитал реальные размеры
+            self.reload_view()
+        except Exception as e:
+            print(f"MiniMap geometry: {e}")
 
 class MiniMapApp:
     def __init__(
-        self,
-        master: tk.Misc | None = None,
-        *,
-        place_above: tuple[int, int, int, int] | None = None,
-        motor_api: dict | None = None,
+            self,
+            master: tk.Misc | None = None,
+            *,
+            container: tk.Misc | None = None,
+            embedded: bool = False,
+            place_above: tuple[int, int, int, int] | None = None,
+            motor_api: dict | None = None,
     ) -> None:
-        self._owns_mainloop = master is None
+        self._embedded = bool(embedded and container is not None)
         self._motor_api = motor_api or {}
-        if master is None:
-            self.root = tk.Tk()
+
+        if self._embedded:
+            # Встроенный режим: используем переданный контейнер
+            self._owns_mainloop = False
+            self.root = container  # Frame из главного окна
+            self.root.configure(bg="#1e1e1e")
+            x = y = 0
+            win_w, win_h = MAP_W + 16, MAP_H + CHROME_H
         else:
-            self.root = tk.Toplevel(master)
-        self.root.overrideredirect(True)
-        self.root.resizable(False, False)
-        self.root.configure(bg="#1e1e1e")
+            # Отдельное окно (как раньше)
+            self._owns_mainloop = master is None
+            if master is None:
+                self.root = tk.Tk()
+            else:
+                self.root = tk.Toplevel(master)
+            self.root.overrideredirect(True)
+            self.root.resizable(False, False)
+            self.root.configure(bg="#1e1e1e")
 
-        win_w, win_h = MAP_W + 16, MAP_H + CHROME_H
-        sw = self.root.winfo_screenwidth()
-        sh = self.root.winfo_screenheight()
+            win_w, win_h = MAP_W + 16, MAP_H + CHROME_H
+            sw = self.root.winfo_screenwidth()
+            sh = self.root.winfo_screenheight()
 
-        if place_above is not None:
-            ax, ay, aw, ah = place_above
-            x = ax + max(0, aw - win_w)
-            y = ay - win_h - GAP
-            if y < GAP:
-                x = ax - win_w - GAP
-                y = ay + ah - win_h
-            y = max(GAP, min(y, sh - win_h - GAP))
-            x = max(GAP, min(x, sw - win_w - GAP))
-        else:
-            x = max(0, sw - win_w - MARGIN)
-            y = max(0, sh - win_h - MARGIN - 48)
+            if place_above is not None:
+                ax, ay, aw, ah = place_above
+                x = ax + max(0, aw - win_w)
+                y = ay - win_h - GAP
+                if y < GAP:
+                    x = ax - win_w - GAP
+                    y = ay + ah - win_h
+                y = max(GAP, min(y, sh - win_h - GAP))
+                x = max(GAP, min(x, sw - win_w - GAP))
+            else:
+                x = max(0, sw - win_w - MARGIN)
+                y = max(0, sh - win_h - MARGIN - 48)
 
-        self.root.geometry(f"{win_w}x{win_h}+{x}+{y}")
-        self.root.attributes("-topmost", True)
-        try:
-            self.root.attributes("-alpha", 0.92)
-        except tk.TclError:
-            pass
-        self.root.lift()
-        self.root.after(200, lambda: self.root.attributes("-topmost", True))
-        self.root.after(300, self.root.lift)
+            self.root.geometry(f"{win_w}x{win_h}+{x}+{y}")
+            self.root.attributes("-topmost", True)
+            try:
+                self.root.attributes("-alpha", 0.92)
+            except tk.TclError:
+                pass
+            self.root.lift()
+            self.root.after(200, lambda: self.root.attributes("-topmost", True))
+            self.root.after(300, self.root.lift)
 
         bg, fg = "#1e1e1e", "#e8e8e8"
         self._bg, self._fg = bg, fg
         self._alert = False
         self.frame = tk.Frame(self.root, bg=bg, padx=4, pady=4)
-        self.frame.pack(fill="both", expand=True)
+        if self._embedded:
+            self.frame.pack(fill="both", expand=True)
+            # Даём минимуму ширины, чтобы canvas 220 px не сжался
+            self.root.update_idletasks()
+        else:
+            self.frame.pack(fill="both", expand=True)
         frame = self.frame
 
         self.entry = tk.Entry(
@@ -475,11 +506,16 @@ class MiniMapApp:
         self.canvas.bind("<MouseWheel>", self._on_wheel)
         self.canvas.bind("<Button-4>", lambda e: self._zoom_by(+1, e.x, e.y))
         self.canvas.bind("<Button-5>", lambda e: self._zoom_by(-1, e.x, e.y))
-        if self._owns_mainloop:
+        if not self._embedded and self._owns_mainloop:
             self.root.bind("<Escape>", lambda _e: self.root.destroy())
 
-        self._hook_keyboard_paste()
-        print(f"MiniMap (frameless) at ({x}, {y}) size {win_w}x{win_h}", flush=True)
+        if not self._embedded:
+            self._hook_keyboard_paste()
+
+        if self._embedded:
+            print(f"MiniMap (embedded) size {win_w}x{win_h}", flush=True)
+        else:
+            print(f"MiniMap (frameless) at ({x}, {y}) size {win_w}x{win_h}", flush=True)
         self.root.after(100, self.reload_view)
 
     # --- clipboard ---
@@ -962,12 +998,27 @@ class MiniMapApp:
         self.go_to_coords()
 
     def run(self) -> None:
-        if not self._owns_mainloop:
+        if self._embedded or not self._owns_mainloop:
             return
         self.root.lift()
         self.root.focus_force()
         self.root.mainloop()
 
+    def destroy(self) -> None:
+        """Аккуратно останавливает миникарту и уничтожает её виджеты."""
+        try:
+            self.autopilot.stop("Закрытие")
+        except Exception:
+            pass
+        try:
+            self.frame.destroy()
+        except Exception:
+            pass
+        if not self._embedded:
+            try:
+                self.root.destroy()
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     print("Starting minimap overlay...", flush=True)

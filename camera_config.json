@@ -11,11 +11,20 @@
     },
     {
       "id": 1,
-      "name": "Камера",
-      "ip": "22222",
-      "port": 554,
+      "name": "Камера 2",
+      "ip": "37.9.243.135",
+      "port": 1556,
       "login": "admin",
-      "password": "323132323",
+      "password": "19720708Aa",
+      "enabled": true
+    },
+    {
+      "id": 2,
+      "name": "Камера 3",
+      "ip": "37.9.243.135",
+      "port": 1557,
+      "login": "admin",
+      "password": "19720708Aa",
       "enabled": true
     }
   ]
