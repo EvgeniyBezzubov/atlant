@@ -8,6 +8,7 @@ import queue
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+
 from kivy.config import Config
 
 # Жёстко горизонтальная ориентация (телефон боком)
