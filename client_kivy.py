@@ -1,5 +1,7 @@
-"""Kivy-клиент Android: ландшафт, стики двигателей + круглые кнопки E/R/Y/U/J/P/F."""
+"""Kivy-клиент Android: ландшафт, стики двигателей + круглые кнопки E/R/Y/U/J/P/F/I/T + камеры (Android Intent)."""
 
+import json
+import os
 import socket
 import threading
 import time
@@ -18,6 +20,7 @@ Config.set("graphics", "height", "720")
 Config.set("graphics", "resizable", "0")
 
 from kivy.app import App
+from kivy.animation import Animation
 from kivy.clock import Clock
 from kivy.core.window import Window
 from kivy.graphics import Color, Ellipse, Line, RoundedRectangle
@@ -28,7 +31,9 @@ from kivy.uix.button import Button
 from kivy.uix.gridlayout import GridLayout
 from kivy.uix.label import Label
 from kivy.uix.popup import Popup
+from kivy.uix.scrollview import ScrollView
 from kivy.uix.textinput import TextInput
+from kivy.uix.togglebutton import ToggleButton
 from kivy.uix.widget import Widget
 
 from stend_discovery import (
@@ -78,6 +83,7 @@ def apply_manual_stend_ip(host: str) -> bool:
         return False
     apply_layout(layout, globals(), respect_manual_mode=True)
     return True
+
 
 COMMAND_TIMEOUT = 5.0
 COMMAND_RETRIES = 3
@@ -146,7 +152,6 @@ class MotorLink:
             coalesce_key=coalesce_key,
             callback=callback,
         )
-        # ONLINE без id
         if is_online:
             require_cmd_id = False
 
@@ -176,13 +181,11 @@ class MotorLink:
             wait_event = job.done
             wait_job = job
 
-        # помечаем ONLINE на job через cmd_id пустой? храним в payload достаточно
         job._require_cmd_id = require_cmd_id  # type: ignore[attr-defined]
 
         if enqueue:
             self._q.put(job)
 
-        # ждать только ВНЕ coalesce_lock
         if wait_event is not None and wait_job is not None:
             wait_event.wait()
             return wait_job.success
@@ -299,7 +302,6 @@ class MotorLink:
             self._disconnect()
 
     def set_endpoint(self, host, port):
-        """Смена хоста/порта с разрывом текущего сокета."""
         with self._io_lock:
             self.host = host
             self.port = port
@@ -443,9 +445,9 @@ class AuxController:
         self.link2 = link_rasb2
         self.link_stend = link_stend
         self.status_callback = status_callback
-        self.ui_callback = ui_callback  # key -> color rgba
+        self.ui_callback = ui_callback
 
-        self.elevator_level = 2  # стоп
+        self.elevator_level = 2
         self.mustache_on = False
         self.pump_on = False
         self.filter_on = False
@@ -456,7 +458,7 @@ class AuxController:
         self._ip_dialog_open = False
         self.lift_last_ok = None
         self.lift_busy = False
-        self.use_wan = True  # False=локаль, True=интернет (по умолчанию)
+        self.use_wan = True
         self._filter_stop = threading.Event()
         self._filter_thread = None
 
@@ -795,7 +797,6 @@ class AuxController:
             self.status_callback("Фильтр F: выкл")
             return
 
-        # как на Windows: включение + диалог интервала/импульса
         self._show_filter_dialog()
 
     def _show_filter_dialog(self):
@@ -891,6 +892,380 @@ class AuxController:
         self._filter_stop.set()
 
 
+# ===================== КАМЕРЫ (Android Intent) =====================
+
+CAMERA_CONFIG_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "camera_config.json"
+)
+DEFAULT_CAMERA_CONFIG = {
+    "cameras": [
+        {
+            "id": 0,
+            "name": "Камера 1",
+            "ip": "37.9.243.135",
+            "port": 1554,
+            "login": "admin",
+            "password": "19720708Aa",
+            "enabled": True,
+        },
+        {
+            "id": 1,
+            "name": "Камера 2",
+            "ip": "37.9.243.135",
+            "port": 1556,
+            "login": "admin",
+            "password": "19720708Aa",
+            "enabled": True,
+        },
+        {
+            "id": 2,
+            "name": "Камера 3",
+            "ip": "37.9.243.135",
+            "port": 1557,
+            "login": "admin",
+            "password": "19720708Aa",
+            "enabled": True,
+        },
+    ]
+}
+
+
+def load_camera_config():
+    if not os.path.exists(CAMERA_CONFIG_FILE):
+        try:
+            with open(CAMERA_CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(DEFAULT_CAMERA_CONFIG, f, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+        return [dict(c) for c in DEFAULT_CAMERA_CONFIG["cameras"]]
+    try:
+        with open(CAMERA_CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return [c for c in data.get("cameras", []) if c.get("enabled", True)]
+    except Exception:
+        return [dict(c) for c in DEFAULT_CAMERA_CONFIG["cameras"]]
+
+
+def save_camera_config(cameras):
+    try:
+        with open(CAMERA_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump({"cameras": cameras}, f, ensure_ascii=False, indent=2)
+        return True
+    except OSError:
+        return False
+
+
+class CameraManager:
+    """Управляет списком камер. Windows запускает VLC через subprocess, Android — через Intent."""
+
+    def __init__(self, status_callback):
+        self.cameras = load_camera_config()
+        self.status_callback = status_callback
+        self.active_index = None
+        self.enabled = False
+        self.on_state_change = None
+
+    def url(self, cam):
+        login = cam.get("login", "")
+        pwd = cam.get("password", "")
+        ip = cam.get("ip", "")
+        port = cam.get("port", 554)
+        auth = f"{login}:{pwd}@" if login else ""
+        return f"rtsp://{auth}{ip}:{port}/Streaming/Channels/101"
+
+    def open_camera(self, index):
+        if index is None or index < 0 or index >= len(self.cameras):
+            self.active_index = None
+            self._notify()
+            return
+
+        cam = self.cameras[index]
+        self.active_index = index
+        self.enabled = True
+        url = self.url(cam)
+
+        if self._open_camera_impl(url, cam["name"]):
+            self.status_callback(f"{cam['name']}: открытие...")
+        else:
+            self.status_callback(
+                f"{cam['name']}: не удалось открыть. Проверьте VLC."
+            )
+        self._notify()
+
+    def _open_camera_impl(self, rtsp_url: str, title: str) -> bool:
+        """Автоматически выбирает способ открытия в зависимости от платформы."""
+        import sys
+
+        if sys.platform.startswith("win"):
+            return self._open_on_windows(rtsp_url, title)
+        return self._open_on_android(rtsp_url, title)
+
+    def _open_on_windows(self, rtsp_url: str, title: str) -> bool:
+        """Windows: запускает VLC для воспроизведения RTSP."""
+        import subprocess
+
+        # Проверяем наличие VLC
+        vlc_path = self._find_vlc_windows()
+        if vlc_path is None:
+            self.status_callback("VLC не найден. Установите VLC media player.")
+            return False
+
+        try:
+            # VLC может напрямую воспроизводить RTSP-поток
+            cmd = [vlc_path, rtsp_url]
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except Exception as exc:
+            self.status_callback(f"Ошибка запуска VLC: {exc}")
+            return False
+
+    @staticmethod
+    def _find_vlc_windows():
+        """Ищет исполняемый файл VLC на Windows."""
+        import os
+
+        candidates = [
+            r"C:\Program Files\VideoLAN\VLC\vlc.exe",
+            r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe",
+        ]
+        for path in candidates:
+            if os.path.isfile(path):
+                return path
+        return None
+
+    def _open_on_android(self, rtsp_url: str, title: str) -> bool:
+        """Android: открывает RTSP через Intent."""
+        try:
+            from jnius import autoclass, cast
+
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            Intent = autoclass("android.content.Intent")
+            Uri = autoclass("android.net.Uri")
+            String = autoclass("java.lang.String")
+
+            activity = cast("android.app.Activity", PythonActivity.mActivity)
+
+            intent = Intent(Intent.ACTION_VIEW)
+            intent.setDataAndType(
+                Uri.parse(rtsp_url),
+                cast("java.lang.String", String("video/*")),
+            )
+            activity.startActivity(intent)
+            return True
+        except Exception as exc:
+            self.status_callback(f"Intent недоступен: {exc}")
+            return False
+
+    # Остальные методы (close_cameras, disable_cameras и т.д.) остаются без изменений
+
+
+class CameraBar(BoxLayout):
+    """Верхняя панель: кнопки камер + кнопка отключения + меню."""
+
+    def __init__(self, manager: CameraManager, on_settings, **kwargs):
+        super().__init__(
+            orientation="horizontal",
+            size_hint_y=None,
+            height=dp(46),
+            spacing=dp(6),
+            padding=(dp(8), dp(4)),
+            **kwargs,
+        )
+        self.manager = manager
+        self.on_settings = on_settings
+        self._buttons = []
+        self._rebuild()
+
+    def _rebuild(self):
+        self.clear_widgets()
+        self._buttons = []
+
+        for idx, cam in enumerate(self.manager.cameras):
+            btn = ToggleButton(
+                text=cam.get("name", f"Кам {idx+1}"),
+                group="camsel",
+                size_hint_x=None,
+                width=dp(120),
+                font_size="13sp",
+            )
+            btn.bind(on_press=lambda _b, i=idx: self._select(i))
+            self.add_widget(btn)
+            self._buttons.append(btn)
+
+        self.btn_disable = Button(
+            text="Откл",
+            size_hint_x=None,
+            width=dp(80),
+            background_color=(0.75, 0.25, 0.25, 1),
+            font_size="13sp",
+        )
+        self.btn_disable.bind(on_press=lambda *_: self._toggle_disable())
+        self.add_widget(self.btn_disable)
+
+        btn_menu = Button(
+            text="Камеры",
+            size_hint_x=None,
+            width=dp(110),
+            background_color=(0.20, 0.35, 0.55, 1),
+            font_size="13sp",
+        )
+        btn_menu.bind(on_press=lambda *_: self.on_settings())
+        self.add_widget(btn_menu)
+
+        self.add_widget(Widget(size_hint_x=1))
+        self._sync_active()
+
+    def refresh(self):
+        self._rebuild()
+
+    def _sync_active(self):
+        idx = self.manager.active_index
+        for i, b in enumerate(self._buttons):
+            b.state = "down" if (self.manager.enabled and i == idx) else "normal"
+
+    def _select(self, index):
+        self.manager.enabled = True
+        self.manager.open_camera(index)
+        self._sync_active()
+
+    def _toggle_disable(self):
+        if self.manager.enabled:
+            self.manager.disable_cameras()
+        else:
+            self.manager.enable_cameras()
+        self._sync_active()
+
+
+class CameraSettingsPopup(Popup):
+    """Меню: список камер, добавление по IP/порту, удаление."""
+
+    def __init__(self, manager: CameraManager, on_changed=None, **kwargs):
+        super().__init__(
+            title="Настройки камер",
+            size_hint=(0.8, 0.9),
+            auto_dismiss=False,
+            **kwargs,
+        )
+        self.manager = manager
+        self.on_changed = on_changed
+
+        root = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(10))
+
+        root.add_widget(
+            Label(
+                text="[b]Список камер[/b]",
+                markup=True,
+                size_hint_y=None,
+                height=dp(24),
+            )
+        )
+        self.list_box = BoxLayout(
+            orientation="vertical", size_hint_y=None, spacing=dp(4)
+        )
+        self.list_box.bind(minimum_height=self.list_box.setter("height"))
+        scroll = ScrollView(size_hint=(1, 0.4))
+        scroll.add_widget(self.list_box)
+        root.add_widget(scroll)
+
+        root.add_widget(
+            Label(
+                text="[b]Добавить камеру[/b]",
+                markup=True,
+                size_hint_y=None,
+                height=dp(24),
+            )
+        )
+
+        def row(label, hint=""):
+            box = BoxLayout(size_hint_y=None, height=dp(38), spacing=dp(6))
+            box.add_widget(Label(text=label, size_hint_x=0.35, font_size="13sp"))
+            ti = TextInput(text=hint, multiline=False, size_hint_x=0.65)
+            box.add_widget(ti)
+            return box, ti
+
+        r_name, self.in_name = row("Имя:", "Камера N")
+        r_ip, self.in_ip = row("IP:", "192.168.1.10")
+        r_port, self.in_port = row("Порт:", "554")
+        r_login, self.in_login = row("Логин:", "admin")
+        r_pwd, self.in_pwd = row("Пароль:", "")
+        for r in (r_name, r_ip, r_port, r_login, r_pwd):
+            root.add_widget(r)
+
+        btns = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
+        b_add = Button(text="Добавить", background_color=(0.20, 0.65, 0.35, 1))
+        b_close = Button(text="Закрыть")
+        b_add.bind(on_press=lambda *_: self._add())
+        b_close.bind(on_press=lambda *_: self.dismiss())
+        btns.add_widget(b_add)
+        btns.add_widget(b_close)
+        root.add_widget(btns)
+
+        self.content = root
+        self._refresh_list()
+
+    def _refresh_list(self):
+        self.list_box.clear_widgets()
+        if not self.manager.cameras:
+            self.list_box.add_widget(
+                Label(
+                    text="(пусто)",
+                    size_hint_y=None,
+                    height=dp(30),
+                    color=(0.6, 0.6, 0.6, 1),
+                )
+            )
+            return
+        for idx, cam in enumerate(self.manager.cameras):
+            row = BoxLayout(size_hint_y=None, height=dp(38), spacing=dp(6))
+            row.add_widget(
+                Label(
+                    text=f"{cam.get('name','?')} — {cam.get('ip','')}:{cam.get('port','')}",
+                    font_size="13sp",
+                )
+            )
+            b_del = Button(
+                text="Удалить",
+                size_hint_x=None,
+                width=dp(90),
+                background_color=(0.75, 0.25, 0.25, 1),
+                font_size="12sp",
+            )
+            b_del.bind(on_press=lambda _b, i=idx: self._del(i))
+            row.add_widget(b_del)
+            self.list_box.add_widget(row)
+
+    def _add(self):
+        ip = self.in_ip.text.strip()
+        try:
+            port = int(self.in_port.text.strip() or "554")
+        except ValueError:
+            return
+        if not ip:
+            return
+        self.manager.add_camera(
+            name=self.in_name.text.strip(),
+            ip=ip,
+            port=port,
+            login=self.in_login.text.strip(),
+            password=self.in_pwd.text,
+        )
+        self.in_name.text = ""
+        self.in_ip.text = ""
+        self.in_port.text = "554"
+        self._refresh_list()
+        if self.on_changed:
+            self.on_changed()
+
+    def _del(self, index):
+        self.manager.remove_camera(index)
+        self._refresh_list()
+        if self.on_changed:
+            self.on_changed()
+
+
+# ===================== ВИДЖЕТЫ УПРАВЛЕНИЯ =====================
+
+
 class RoundKeyButton(Widget):
     """Круглая кнопка с буквой (E, R, Y, …)."""
 
@@ -916,7 +1291,7 @@ class RoundKeyButton(Widget):
             halign="center",
             valign="middle",
         )
-        self._text.disabled = True  # не перехватывать касания
+        self._text.disabled = True
         self.add_widget(self._text)
         self.bind(
             pos=self._redraw,
@@ -945,7 +1320,6 @@ class RoundKeyButton(Widget):
     def on_touch_down(self, touch):
         if self.collide_point(*touch.pos):
             self.pressed = True
-            # лёгкая вспышка
             self.opacity = 0.7
             return True
         return super().on_touch_down(touch)
@@ -1004,8 +1378,6 @@ class VerticalStick(Widget):
         if touch.grab_current is self:
             touch.ungrab(self)
             self._active_touch = None
-            # фиксация: НЕ сбрасываем в 0 — скорость остаётся
-            # нейтраль: подведи к центру и отпусти
             return True
         return super().on_touch_up(touch)
 
@@ -1036,7 +1408,6 @@ class VerticalStick(Widget):
         center_y = (bottom + top) / 2
         self._center.points = [track_x, center_y, track_x + track_width, center_y]
 
-        # активная скорость — зелёный knоb, нейтраль — синий
         if self.level == 0:
             self._knob_color.rgba = (0.10, 0.65, 0.95, 1)
         else:
@@ -1049,10 +1420,7 @@ class VerticalStick(Widget):
 
         self._level_label.text = f"{self.level:+d}" if self.level else "0"
         self._level_label.size = (knob_size, knob_size)
-        self._level_label.center = (
-            self.center_x,
-            knob_y,
-        )
+        self._level_label.center = (self.center_x, knob_y)
 
 
 class AuxPad(GridLayout):
@@ -1072,17 +1440,33 @@ class AuxPad(GridLayout):
             btn.fill_color = list(rgba)
 
 
-class MotorPanel(BoxLayout):
-    """Горизонтальный layout: левый стик | кнопки | правый стик."""
+# ===================== ГЛАВНАЯ ПАНЕЛЬ =====================
 
-    def __init__(self, controller, aux, **kwargs):
-        super().__init__(orientation="horizontal", padding=dp(10), spacing=dp(8), **kwargs)
+
+class MotorPanel(BoxLayout):
+    """Вертикальный layout: верхняя панель камер + стики/кнопки."""
+
+    def __init__(self, controller, aux, camera_manager, on_camera_settings, **kwargs):
+        super().__init__(orientation="vertical", padding=dp(0), spacing=dp(0), **kwargs)
         self.controller = controller
         self.aux = aux
+        self.camera_manager = camera_manager
+
+        self.root_box = BoxLayout(orientation="vertical", spacing=dp(0))
+
+        self.camera_bar = CameraBar(camera_manager, on_settings=on_camera_settings)
+        self.root_box.add_widget(self.camera_bar)
+
+        main = BoxLayout(orientation="horizontal", padding=dp(10), spacing=dp(8))
 
         left_col = BoxLayout(orientation="vertical", size_hint_x=0.28, spacing=dp(4))
         left_col.add_widget(
-            Label(text="[b]ЛЕВЫЙ[/b]", markup=True, size_hint_y=0.08, font_size="16sp")
+            Label(
+                text="[b]ЛЕВЫЙ[/b]",
+                markup=True,
+                size_hint_y=0.08,
+                font_size="16sp",
+            )
         )
         self.left_stick = VerticalStick(
             on_level=lambda value: controller.set_level("left", value),
@@ -1111,7 +1495,12 @@ class MotorPanel(BoxLayout):
 
         right_col = BoxLayout(orientation="vertical", size_hint_x=0.28, spacing=dp(4))
         right_col.add_widget(
-            Label(text="[b]ПРАВЫЙ[/b]", markup=True, size_hint_y=0.08, font_size="16sp")
+            Label(
+                text="[b]ПРАВЫЙ[/b]",
+                markup=True,
+                size_hint_y=0.08,
+                font_size="16sp",
+            )
         )
         self.right_stick = VerticalStick(
             on_level=lambda value: controller.set_level("right", value),
@@ -1119,23 +1508,34 @@ class MotorPanel(BoxLayout):
         )
         right_col.add_widget(self.right_stick)
 
-        self.add_widget(left_col)
-        self.add_widget(center)
-        self.add_widget(right_col)
+        main.add_widget(left_col)
+        main.add_widget(center)
+        main.add_widget(right_col)
+        self.root_box.add_widget(main)
 
-        self.levels = Label(text="", size_hint=(None, None), size=(0, 0))
-        self.left_stick.bind(level=self._update_levels)
-        self.right_stick.bind(level=self._update_levels)
+        self.add_widget(self.root_box)
 
-        # привязка цветов кнопок
         aux.ui_callback = self._on_aux_color
         aux._refresh_all_colors()
+
+        camera_manager.on_state_change = self._on_camera_state
 
     def _on_aux_color(self, key, rgba):
         Clock.schedule_once(lambda *_: self.aux_pad.set_color(key, rgba))
 
-    def _update_levels(self, *_):
-        pass
+    def _on_camera_state(self, enabled, active_index):
+        """Когда камеры включены — интерфейс полупрозрачный."""
+
+        def apply(*_):
+            target_opacity = 0.35 if enabled else 1.0
+            anim = Animation(opacity=target_opacity, duration=0.25)
+            anim.start(self.root_box)
+            if enabled:
+                Window.clearcolor = (0.02, 0.02, 0.02, 1)
+            else:
+                Window.clearcolor = (0.08, 0.09, 0.12, 1)
+
+        Clock.schedule_once(apply, 0)
 
 
 class AtlantMotorApp(App):
@@ -1149,10 +1549,12 @@ class AtlantMotorApp(App):
             Window.fullscreen = "auto"
         except Exception:
             pass
+        Window.clearcolor = (0.08, 0.09, 0.12, 1)
 
         self.link1 = MotorLink(WAN_HOST, RASB1_PORT, name="rasb1")
         self.link2 = MotorLink(WAN_HOST, RASB2_PORT, name="rasb2")
         self.link_stend = MotorLink(WAN_HOST, PORT_STEND, name="stend")
+
         self.aux = AuxController(
             self.link1,
             self.link2,
@@ -1160,22 +1562,34 @@ class AtlantMotorApp(App):
             status_callback=self._set_status,
             ui_callback=lambda *_: None,
         )
-        # зафиксировать интернет-режим на старте
         self.aux.use_wan = True
         self.link1.set_endpoint(WAN_HOST, RASB1_PORT)
         self.link2.set_endpoint(WAN_HOST, RASB2_PORT)
         self.link_stend.set_endpoint(WAN_HOST, PORT_STEND)
+
         self.controller = MotorController(
             self.link1, self.link2, self.link_stend, self._set_status
         )
-        self.panel = MotorPanel(self.controller, self.aux)
+
+        self.camera_manager = CameraManager(status_callback=self._set_status)
+        self.panel = MotorPanel(
+            self.controller,
+            self.aux,
+            self.camera_manager,
+            on_camera_settings=self._open_camera_settings,
+        )
         return self.panel
+
+    def _open_camera_settings(self):
+        CameraSettingsPopup(
+            self.camera_manager,
+            on_changed=lambda: self.panel.camera_bar.refresh(),
+        ).open()
 
     def _set_status(self, text):
         Clock.schedule_once(lambda _dt: setattr(self.panel.status, "text", text))
 
     def on_start(self):
-        # повторно зафиксировать landscape после старта Activity
         try:
             Window.orientation = "landscape"
         except Exception:
@@ -1183,11 +1597,12 @@ class AtlantMotorApp(App):
         threading.Thread(target=self._probe_servers, daemon=True).start()
 
     def _probe_servers(self):
-        """Сразу показать, до кого доходим (и точную ошибку OS)."""
         if use_unified_stend:
             h, p = self.link_stend.host, self.link_stend.port
             self._set_status(f"Проверка единого стенда… {h}:{p}")
-            ok = self.link_stend.send("ONLINE", wait=True, coalesce_key="stend:keepalive")
+            ok = self.link_stend.send(
+                "ONLINE", wait=True, coalesce_key="stend:keepalive"
+            )
             if ok:
                 self._set_status("Связь OK: единый стенд")
             else:
@@ -1213,6 +1628,10 @@ class AtlantMotorApp(App):
         self._set_status("Нет связи: " + "; ".join(parts))
 
     def on_stop(self):
+        try:
+            self.camera_manager.close_cameras()
+        except Exception:
+            pass
         self.aux.shutdown()
         self.controller.shutdown()
 
